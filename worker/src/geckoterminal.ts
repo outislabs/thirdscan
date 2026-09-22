@@ -8,12 +8,21 @@ const RETRY_BACKOFF_MS = [15_000, 30_000, 60_000];
 
 interface PoolsResponse {
   data: {
+    id?: string;
     relationships?: {
       base_token?: {
         data?: { id?: string };
       };
     };
   }[];
+}
+
+interface OhlcvResponse {
+  data: {
+    attributes: {
+      ohlcv_list: [number, number | null, number | null, number | null, number | null, number | null][];
+    };
+  };
 }
 
 interface TokensMultiResponse {
@@ -40,6 +49,20 @@ export interface TokenMetrics {
   volume_24h: number | null;
   liquidity_usd: number | null;
   market_cap: number | null;
+}
+
+export interface DiscoveredToken {
+  address: string;
+  poolAddress: string;
+}
+
+export interface OhlcvCandle {
+  ts: string;
+  open: number | null;
+  high: number | null;
+  low: number | null;
+  close: number | null;
+  volume_usd: number | null;
 }
 
 function parseNumeric(value: string | null | undefined): number | null {
@@ -78,24 +101,30 @@ async function getJson<T>(url: string): Promise<T> {
   }
 }
 
+function stripNetworkPrefix(id: string): string | null {
+  // ids are formatted "<network>_<address>", e.g. "solana_So1111...".
+  const prefix = `${NETWORK}_`;
+  return id.startsWith(prefix) ? id.slice(prefix.length) : null;
+}
+
 /**
  * Fetches one page of the top solana pools by 24h volume and returns the
- * unique base token addresses referenced on that page.
+ * base token address + pool address pairs referenced on that page.
  */
-export async function fetchPoolsPageBaseTokenAddresses(page: number): Promise<string[]> {
+export async function fetchPoolsPage(page: number): Promise<DiscoveredToken[]> {
   const url = `${BASE_URL}/networks/${NETWORK}/pools?sort=h24_volume_usd_desc&page=${page}`;
   const json = await getJson<PoolsResponse>(url);
-  const addresses = new Set<string>();
+  const results: DiscoveredToken[] = [];
   for (const pool of json.data ?? []) {
-    const id = pool.relationships?.base_token?.data?.id;
-    if (!id) continue;
-    // ids are formatted "<network>_<address>", e.g. "solana_So1111...".
-    const prefix = `${NETWORK}_`;
-    if (id.startsWith(prefix)) {
-      addresses.add(id.slice(prefix.length));
-    }
+    const baseTokenId = pool.relationships?.base_token?.data?.id;
+    const poolId = pool.id;
+    if (!baseTokenId || !poolId) continue;
+    const address = stripNetworkPrefix(baseTokenId);
+    const poolAddress = stripNetworkPrefix(poolId);
+    if (!address || !poolAddress) continue;
+    results.push({ address, poolAddress });
   }
-  return [...addresses];
+  return results;
 }
 
 export function chunk<T>(items: T[], size: number): T[][] {
@@ -131,3 +160,26 @@ export async function fetchTokensMulti(addresses: string[]): Promise<TokenMetric
 }
 
 export const METRICS_CHUNK_SIZE = MAX_ADDRESSES_PER_METRICS_CALL;
+
+const OHLCV_TIMEFRAME = "hour";
+const OHLCV_AGGREGATE = 1;
+const OHLCV_LIMIT = 168; // 7 days of hourly candles
+
+/**
+ * Fetches hourly OHLCV candles (last 7 days) for a single pool.
+ */
+export async function fetchPoolOhlcvHourly(poolAddress: string): Promise<OhlcvCandle[]> {
+  const url =
+    `${BASE_URL}/networks/${NETWORK}/pools/${poolAddress}/ohlcv/${OHLCV_TIMEFRAME}` +
+    `?aggregate=${OHLCV_AGGREGATE}&limit=${OHLCV_LIMIT}`;
+  const json = await getJson<OhlcvResponse>(url);
+  const list = json.data?.attributes?.ohlcv_list ?? [];
+  return list.map(([timestamp, open, high, low, close, volume]) => ({
+    ts: new Date(timestamp * 1000).toISOString(),
+    open,
+    high,
+    low,
+    close,
+    volume_usd: volume,
+  }));
+}

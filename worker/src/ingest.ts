@@ -1,32 +1,41 @@
 import { supabase } from "./supabase.js";
+import { writeWorkerStatus } from "./workerStatus.js";
 import {
   chunk,
-  fetchPoolsPageBaseTokenAddresses,
+  fetchPoolsPage,
   fetchTokensMulti,
   METRICS_CHUNK_SIZE,
+  type DiscoveredToken,
   type TokenMetrics,
 } from "./geckoterminal.js";
 
 const CHAIN = "solana";
 const DISCOVER_PAGES = [1, 2, 3, 4, 5];
 const MAX_TOKENS = 100;
-const WORKER_NAME = "geckoterminal";
+export const PRICE_WORKER_NAME = "geckoterminal";
 
-async function discoverAddresses(errors: string[]): Promise<string[]> {
-  const seen = new Set<string>();
+async function discoverTokens(errors: string[]): Promise<DiscoveredToken[]> {
+  // address -> pool address, first-seen wins (pages are sorted by desc 24h
+  // volume, so the first pool a token appears in is its top pool).
+  const seen = new Map<string, string>();
   for (const page of DISCOVER_PAGES) {
     if (seen.size >= MAX_TOKENS) break;
     try {
-      const addresses = await fetchPoolsPageBaseTokenAddresses(page);
-      for (const address of addresses) {
-        seen.add(address);
-        if (seen.size >= MAX_TOKENS) break;
+      const entries = await fetchPoolsPage(page);
+      for (const { address, poolAddress } of entries) {
+        if (!seen.has(address)) {
+          if (seen.size >= MAX_TOKENS) break;
+          seen.set(address, poolAddress);
+        }
       }
     } catch (err) {
       errors.push(`discover page ${page}: ${(err as Error).message}`);
     }
   }
-  return [...seen].slice(0, MAX_TOKENS);
+  return [...seen.entries()].slice(0, MAX_TOKENS).map(([address, poolAddress]) => ({
+    address,
+    poolAddress,
+  }));
 }
 
 async function fetchAllMetrics(addresses: string[], errors: string[]): Promise<TokenMetrics[]> {
@@ -42,7 +51,11 @@ async function fetchAllMetrics(addresses: string[], errors: string[]): Promise<T
   return results;
 }
 
-async function upsertTokens(metrics: TokenMetrics[], errors: string[]): Promise<void> {
+async function upsertTokens(
+  metrics: TokenMetrics[],
+  poolAddressByAddress: Map<string, string>,
+  errors: string[],
+): Promise<void> {
   if (metrics.length === 0) return;
   const rows = metrics.map((m) => ({
     chain: CHAIN,
@@ -51,6 +64,7 @@ async function upsertTokens(metrics: TokenMetrics[], errors: string[]): Promise<
     name: m.name,
     decimals: m.decimals,
     is_rwa: false,
+    pool_address: poolAddressByAddress.get(m.address) ?? null,
   }));
   const { error } = await supabase
     .from("tokens")
@@ -71,7 +85,7 @@ async function insertTokenMetrics(metrics: TokenMetrics[], errors: string[]): Pr
     liquidity_usd: m.liquidity_usd,
     market_cap: m.market_cap,
     price_change_24h: null,
-    source: WORKER_NAME,
+    source: PRICE_WORKER_NAME,
     fetched_at: fetchedAt,
     is_estimate: false,
   }));
@@ -81,37 +95,29 @@ async function insertTokenMetrics(metrics: TokenMetrics[], errors: string[]): Pr
   }
 }
 
-async function writeWorkerStatus(errors: string[]): Promise<void> {
-  const { error } = await supabase.from("worker_status").upsert(
-    {
-      worker_name: WORKER_NAME,
-      last_run_at: new Date().toISOString(),
-      last_error: errors.length > 0 ? errors.join("; ").slice(0, 2000) : null,
-    },
-    { onConflict: "worker_name" },
-  );
-  if (error) {
-    // worker_status itself failed to write; nothing left to log it to but stdout.
-    console.error(`failed to write worker_status: ${error.message}`);
-  }
-}
-
-export async function runCycle(): Promise<void> {
+/**
+ * Runs the price/discovery cycle and returns the tokens discovered this run
+ * (address + top pool address), for the ohlcv job to reuse.
+ */
+export async function runPriceCycle(): Promise<DiscoveredToken[]> {
   const errors: string[] = [];
 
-  const addresses = await discoverAddresses(errors);
-  console.log(`discovered ${addresses.length} unique base token addresses`);
+  const discovered = await discoverTokens(errors);
+  console.log(`discovered ${discovered.length} unique base token addresses`);
 
-  const metrics = await fetchAllMetrics(addresses, errors);
+  const metrics = await fetchAllMetrics(discovered.map((t) => t.address), errors);
   console.log(`fetched metrics for ${metrics.length} tokens`);
 
-  await upsertTokens(metrics, errors);
+  const poolAddressByAddress = new Map(discovered.map((t) => [t.address, t.poolAddress]));
+  await upsertTokens(metrics, poolAddressByAddress, errors);
   await insertTokenMetrics(metrics, errors);
-  await writeWorkerStatus(errors);
+  await writeWorkerStatus(PRICE_WORKER_NAME, errors);
 
   if (errors.length > 0) {
-    console.error(`cycle completed with ${errors.length} error(s):`, errors);
+    console.error(`price cycle completed with ${errors.length} error(s):`, errors);
   } else {
-    console.log("cycle completed successfully");
+    console.log("price cycle completed successfully");
   }
+
+  return discovered;
 }

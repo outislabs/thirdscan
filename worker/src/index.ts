@@ -1,7 +1,9 @@
-import { runCycle } from "./ingest.js";
+import { runPriceCycle } from "./ingest.js";
+import { runOhlcvCycle } from "./ohlcv.js";
 
 const ONCE = process.argv.includes("--once");
-const INTERVAL_MS = 5 * 60 * 1000;
+const PRICE_INTERVAL_MS = 5 * 60 * 1000;
+const OHLCV_INTERVAL_MS = 15 * 60 * 1000;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -9,17 +11,27 @@ function sleep(ms: number): Promise<void> {
 
 async function main(): Promise<void> {
   if (ONCE) {
-    await runCycle();
+    const discovered = await runPriceCycle();
+    await runOhlcvCycle(discovered);
     return;
   }
 
   // run continuously, waiting out the interval between cycle *completions*
-  // so a slow cycle never overlaps with the next one.
+  // so a slow cycle never overlaps with the next one. ohlcv runs on its own,
+  // slower cadence, piggybacking on whichever price cycle crosses the 15-min mark.
+  let lastOhlcvAt = 0;
+
   for (;;) {
     const startedAt = Date.now();
-    await runCycle();
+    const discovered = await runPriceCycle();
+
+    if (startedAt - lastOhlcvAt >= OHLCV_INTERVAL_MS) {
+      await runOhlcvCycle(discovered);
+      lastOhlcvAt = Date.now();
+    }
+
     const elapsed = Date.now() - startedAt;
-    const remaining = Math.max(INTERVAL_MS - elapsed, 0);
+    const remaining = Math.max(PRICE_INTERVAL_MS - elapsed, 0);
     await sleep(remaining);
   }
 }
