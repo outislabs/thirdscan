@@ -1,5 +1,6 @@
 import { runPriceCycle } from "./ingest.js";
 import { runOhlcvCycle } from "./ohlcv.js";
+import { runDexscreenerCycle } from "./dexscreener.js";
 
 const ONCE = process.argv.includes("--once");
 const PRICE_INTERVAL_MS = 5 * 60 * 1000;
@@ -12,6 +13,7 @@ function sleep(ms: number): Promise<void> {
 async function main(): Promise<void> {
   if (ONCE) {
     const discovered = await runPriceCycle();
+    await runDexscreenerCycle(discovered.map((t) => t.address));
     await runOhlcvCycle(discovered);
     return;
   }
@@ -24,6 +26,7 @@ async function main(): Promise<void> {
   for (;;) {
     const startedAt = Date.now();
     const discovered = await runPriceCycle();
+    await runDexscreenerCycle(discovered.map((t) => t.address));
 
     if (startedAt - lastOhlcvAt >= OHLCV_INTERVAL_MS) {
       await runOhlcvCycle(discovered);

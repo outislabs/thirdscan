@@ -1,10 +1,14 @@
-import { sleep, throttle } from "./rateLimiter.js";
+import { createThrottle, sleep } from "./rateLimiter.js";
 
 const BASE_URL = "https://api.geckoterminal.com/api/v2";
 const NETWORK = "solana";
 const MAX_ADDRESSES_PER_METRICS_CALL = 30;
 const MAX_429_RETRIES = 3;
 const RETRY_BACKOFF_MS = [15_000, 30_000, 60_000];
+
+// geckoterminal's public api allows 30 calls/min in theory, but was observed
+// rate-limiting well before that. stay well under it: ~10 calls/min.
+const throttle = createThrottle(10);
 
 interface PoolsResponse {
   data: {
