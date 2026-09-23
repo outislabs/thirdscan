@@ -5,9 +5,6 @@ import { createThrottle } from "./rateLimiter.js";
 // run against the account's actual plan and observed to hold up.
 const throttle = createThrottle(10);
 
-const MAX_ACCOUNT_PAGES = 50; // safety cap: 50 pages * 1000 = 50k holders per token
-const ACCOUNTS_PAGE_LIMIT = 1000;
-
 function rpcUrl(): string {
   return `https://mainnet.helius-rpc.com/?api-key=${env.HELIUS_API_KEY}`;
 }
@@ -54,54 +51,64 @@ export async function fetchTokenSupply(mint: string): Promise<TokenSupply | null
   };
 }
 
-export interface RawTokenAccount {
-  owner: string;
-  amount: number;
-}
-
-interface GetTokenAccountsResult {
-  token_accounts?: { owner?: string; amount?: number; address?: string }[];
-  total?: number;
-  cursor?: string;
+export interface LargestAccount {
+  // the token ACCOUNT address, not the owning wallet -- getTokenLargestAccounts
+  // doesn't return an owner. holders.ts resolves it separately via
+  // fetchAccountOwner and aggregates accounts that share one.
+  address: string;
+  amount: number | null;
+  decimals: number | null;
 }
 
 /**
- * Pages through helius's getTokenAccounts for a mint, collecting every
- * (owner, amount) pair. Not the standard solana RPC method -- this is
- * helius's enhanced endpoint, paginated via `page` or `cursor` depending on
- * account/version; both are handled here since that isn't pinned down
- * without live testing against the account's actual API responses.
+ * Standard Solana JSON-RPC getTokenLargestAccounts, proxied through helius:
+ * the top 20 token accounts for a mint by balance, in a single call, already
+ * sorted descending by the RPC spec. No pagination, so no statement-timeout
+ * risk on high-holder-count mints (SOL, USDC) the way getTokenAccounts had.
  */
-export async function fetchAllTokenAccounts(mint: string): Promise<RawTokenAccount[]> {
-  const accounts: RawTokenAccount[] = [];
-  let page = 1;
-  let cursor: string | undefined;
-
-  for (let i = 0; i < MAX_ACCOUNT_PAGES; i++) {
-    const params: Record<string, unknown> = { mint, limit: ACCOUNTS_PAGE_LIMIT };
-    if (cursor) {
-      params.cursor = cursor;
-    } else {
-      params.page = page;
-    }
-    const result = await rpcCall<GetTokenAccountsResult>("getTokenAccounts", params);
-    const batch = result.token_accounts ?? [];
-
-    for (const acct of batch) {
-      if (!acct.owner || acct.amount === undefined) continue;
-      accounts.push({ owner: acct.owner, amount: acct.amount });
-    }
-
-    if (result.cursor) {
-      cursor = result.cursor;
-    } else if (batch.length < ACCOUNTS_PAGE_LIMIT) {
-      break;
-    } else {
-      page += 1;
-    }
-
-    if (batch.length === 0) break;
+export async function fetchTokenLargestAccounts(mint: string): Promise<LargestAccount[]> {
+  interface Entry {
+    address?: string;
+    amount?: string;
+    decimals?: number;
   }
+  interface Result {
+    value?: Entry[] | null;
+  }
+  const result = await rpcCall<Result>("getTokenLargestAccounts", [mint]);
+  return (result.value ?? [])
+    .filter((entry): entry is Entry & { address: string } => !!entry.address)
+    .map((entry) => {
+      const amount = entry.amount !== undefined ? Number(entry.amount) : null;
+      return {
+        address: entry.address,
+        amount: amount !== null && Number.isFinite(amount) ? amount : null,
+        decimals: entry.decimals ?? null,
+      };
+    });
+}
 
-  return accounts;
+/**
+ * Resolves the owning wallet of an SPL token account via standard Solana
+ * getAccountInfo (jsonParsed), proxied through helius. Returns null if the
+ * account can't be parsed as a token account -- callers should treat that
+ * as "unresolved", not as any kind of fallback owner.
+ */
+export async function fetchAccountOwner(accountAddress: string): Promise<string | null> {
+  interface Result {
+    value?: {
+      data?: {
+        parsed?: {
+          info?: {
+            owner?: string;
+          };
+        };
+      } | null;
+    } | null;
+  }
+  const result = await rpcCall<Result>("getAccountInfo", [
+    accountAddress,
+    { encoding: "jsonParsed" },
+  ]);
+  return result.value?.data?.parsed?.info?.owner ?? null;
 }

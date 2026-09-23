@@ -1,13 +1,17 @@
 import { supabase } from "./supabase.js";
 import { writeWorkerStatus } from "./workerStatus.js";
 import { env } from "./env.js";
-import { fetchAllTokenAccounts, fetchTokenSupply, type RawTokenAccount } from "./helius.js";
+import {
+  fetchAccountOwner,
+  fetchTokenLargestAccounts,
+  fetchTokenSupply,
+  type LargestAccount,
+} from "./helius.js";
 
 const CHAIN = "solana";
 export const HOLDERS_WORKER_NAME = "helius_holders";
 const MAX_TOKENS_PER_RUN = 10;
 const STALE_AFTER_MS = 6 * 60 * 60 * 1000;
-const TOP_HOLDERS_LIMIT = 100;
 
 interface CandidateToken {
   address: string;
@@ -49,12 +53,66 @@ async function selectCandidateTokens(errors: string[]): Promise<CandidateToken[]
   return candidates.filter((c) => !fresh.has(c.address));
 }
 
-function aggregateByOwner(accounts: RawTokenAccount[]): Map<string, number> {
-  const balances = new Map<string, number>();
-  for (const { owner, amount } of accounts) {
-    balances.set(owner, (balances.get(owner) ?? 0) + amount);
+interface ResolvedAccount extends LargestAccount {
+  owner: string | null;
+}
+
+interface AggregatedHolder {
+  holderAddress: string | null; // resolved owner wallet, or null if unresolved
+  tokenAccount: string; // representative account -- see aggregateByOwner
+  amount: number;
+  decimals: number | null;
+}
+
+/**
+ * Groups accounts that share a resolved owner, summing their balances (one
+ * owner can hold several accounts for the same mint). Accounts whose owner
+ * couldn't be resolved are kept as their own row with holderAddress null --
+ * never merged into another owner's total or mislabeled as their own owner.
+ * The representative tokenAccount for a merged owner is their single
+ * largest individual account, just for having something concrete to show.
+ */
+function aggregateByOwner(entries: ResolvedAccount[]): AggregatedHolder[] {
+  const byOwner = new Map<string, ResolvedAccount[]>();
+  const unresolved: ResolvedAccount[] = [];
+
+  for (const entry of entries) {
+    if (entry.amount === null) continue; // no amount to rank or sum
+    if (entry.owner) {
+      const group = byOwner.get(entry.owner) ?? [];
+      group.push(entry);
+      byOwner.set(entry.owner, group);
+    } else {
+      unresolved.push(entry);
+    }
   }
-  return balances;
+
+  const rows: AggregatedHolder[] = [];
+
+  for (const [owner, group] of byOwner) {
+    const total = group.reduce((sum, e) => sum + (e.amount as number), 0);
+    const representative = group.reduce((best, e) =>
+      (e.amount as number) > (best.amount as number) ? e : best,
+    );
+    rows.push({
+      holderAddress: owner,
+      tokenAccount: representative.address,
+      amount: total,
+      decimals: representative.decimals,
+    });
+  }
+
+  for (const entry of unresolved) {
+    rows.push({
+      holderAddress: null,
+      tokenAccount: entry.address,
+      amount: entry.amount as number,
+      decimals: entry.decimals,
+    });
+  }
+
+  rows.sort((a, b) => b.amount - a.amount);
+  return rows;
 }
 
 async function processToken(token: CandidateToken, errors: string[]): Promise<void> {
@@ -65,36 +123,55 @@ async function processToken(token: CandidateToken, errors: string[]): Promise<vo
     errors.push(`getTokenSupply ${address}: ${(err as Error).message}`);
     return null;
   });
-  const decimals = supply?.decimals ?? token.decimals ?? null;
   const totalSupplyRaw = supply?.amount ?? null;
 
-  const accounts = await fetchAllTokenAccounts(address);
-  const balances = aggregateByOwner(accounts);
-  const holderCount = balances.size;
+  // already sorted descending by the rpc spec, and already capped at 20 --
+  // there is no "top 100" here, getTokenLargestAccounts only ever returns 20.
+  const largest = await fetchTokenLargestAccounts(address);
 
-  const sorted = [...balances.entries()].sort((a, b) => b[1] - a[1]);
-  const top = sorted.slice(0, TOP_HOLDERS_LIMIT);
+  // resolved sequentially, not in parallel: the shared throttle isn't safe
+  // against concurrent callers racing its lastCallAt check.
+  const resolved: ResolvedAccount[] = [];
+  for (const entry of largest) {
+    let owner: string | null = null;
+    try {
+      owner = await fetchAccountOwner(entry.address);
+    } catch (err) {
+      console.warn(
+        `holders: owner resolution failed for account ${entry.address} (mint ${address}): ${(err as Error).message}`,
+      );
+    }
+    resolved.push({ ...entry, owner });
+  }
 
-  const percentOf = (rawAmount: number): number | null =>
-    totalSupplyRaw && totalSupplyRaw > 0 ? (rawAmount / totalSupplyRaw) * 100 : null;
+  const aggregated = aggregateByOwner(resolved);
 
-  const toUiBalance = (rawAmount: number): number | null =>
-    decimals !== null ? rawAmount / 10 ** decimals : null;
+  const percentOf = (rawAmount: number | null): number | null =>
+    rawAmount !== null && totalSupplyRaw && totalSupplyRaw > 0
+      ? (rawAmount / totalSupplyRaw) * 100
+      : null;
 
-  const holderRows = top.map(([holderAddress, rawAmount], i) => ({
-    chain: CHAIN,
-    address,
-    holder_address: holderAddress,
-    balance: toUiBalance(rawAmount),
-    percent_of_supply: percentOf(rawAmount),
-    rank: i + 1,
-    source: HOLDERS_WORKER_NAME,
-    fetched_at: fetchedAt,
-  }));
+  const holderRows = aggregated.map((row, i) => {
+    const decimals = row.decimals ?? supply?.decimals ?? token.decimals ?? null;
+    const balance = decimals !== null ? row.amount / 10 ** decimals : null;
+    return {
+      chain: CHAIN,
+      address,
+      holder_address: row.holderAddress,
+      token_account: row.tokenAccount,
+      balance,
+      percent_of_supply: percentOf(row.amount),
+      rank: i + 1,
+      source: HOLDERS_WORKER_NAME,
+      fetched_at: fetchedAt,
+    };
+  });
 
   const sumPercent = (n: number): number | null => {
     if (!totalSupplyRaw || totalSupplyRaw <= 0) return null;
-    const rawSum = sorted.slice(0, n).reduce((acc, [, amount]) => acc + amount, 0);
+    const slice = aggregated.slice(0, n);
+    if (slice.length === 0) return null;
+    const rawSum = slice.reduce((sum, row) => sum + row.amount, 0);
     return (rawSum / totalSupplyRaw) * 100;
   };
 
@@ -119,9 +196,11 @@ async function processToken(token: CandidateToken, errors: string[]): Promise<vo
   const { error: statsError } = await supabase.from("token_holder_stats").insert({
     chain: CHAIN,
     address,
-    holder_count: holderCount > 0 ? holderCount : null,
+    // getTokenLargestAccounts gives no way to know total holder count
+    // without pagination (which is what we're avoiding); not estimated.
+    holder_count: null,
     top10_percent: sumPercent(10),
-    top50_percent: sumPercent(50),
+    top20_percent: sumPercent(20),
     source: HOLDERS_WORKER_NAME,
     fetched_at: fetchedAt,
   });
@@ -132,8 +211,11 @@ async function processToken(token: CandidateToken, errors: string[]): Promise<vo
 
 /**
  * For up to MAX_TOKENS_PER_RUN tokens from v_screener with no risk_flag,
- * skipping any fetched in the last 6 hours, pages through helius holder
- * data and stores the top 100 holders plus concentration stats.
+ * skipping any fetched in the last 6 hours, fetches the top 20 accounts by
+ * balance via helius (getTokenLargestAccounts), resolves each account's
+ * owner wallet, aggregates accounts under the same owner, and stores the
+ * result plus concentration stats. holder_count is not tracked -- this
+ * method has no way to know it.
  */
 export async function runHoldersCycle(): Promise<void> {
   const errors: string[] = [];
