@@ -1,9 +1,9 @@
 import { env } from "./env.js";
 import { createThrottle } from "./rateLimiter.js";
 
-// helius's rate limits vary by plan; stay conservative until this has been
-// run against the account's actual plan and observed to hold up.
-const throttle = createThrottle(10);
+// helius's free tier allows 10 requests/sec (600/min); stay conservative
+// against that.
+const throttle = createThrottle(300);
 
 function rpcUrl(): string {
   return `https://mainnet.helius-rpc.com/?api-key=${env.HELIUS_API_KEY}`;

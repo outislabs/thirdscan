@@ -19,4 +19,7 @@ export const env = {
   // error) rather than crash the whole process when this is unset, so the
   // other jobs keep running without a helius key.
   HELIUS_API_KEY: optional("HELIUS_API_KEY"),
+  // optional: jupiter.ts uses the keyless lite-api.jup.ag endpoint when
+  // this is unset, and api.jup.ag (with this as x-api-key) when it is.
+  JUP_API_KEY: optional("JUP_API_KEY"),
 };

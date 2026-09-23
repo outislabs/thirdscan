@@ -13,12 +13,25 @@ export const HOLDERS_WORKER_NAME = "helius_holders";
 const MAX_TOKENS_PER_RUN = 10;
 const STALE_AFTER_MS = 6 * 60 * 60 * 1000;
 
+// getTokenLargestAccounts fails on these with "too many accounts requested"
+// (holder count is enormous), and holder concentration isn't a meaningful
+// signal for them anyway -- skip proactively instead of retrying and
+// failing every cycle.
+const SKIPPED_MINTS: Record<string, string> = {
+  So11111111111111111111111111111111111111112: "wrapped SOL",
+  EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v: "USDC",
+  Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB: "USDT",
+};
+
 interface CandidateToken {
   address: string;
   decimals: number | null;
 }
 
-async function selectCandidateTokens(errors: string[]): Promise<CandidateToken[]> {
+async function selectCandidateTokens(
+  errors: string[],
+  notes: string[],
+): Promise<CandidateToken[]> {
   const { data: screened, error: screenerError } = await supabase
     .from("v_screener")
     .select("address, decimals")
@@ -29,7 +42,19 @@ async function selectCandidateTokens(errors: string[]): Promise<CandidateToken[]
     errors.push(`query v_screener: ${screenerError.message}`);
     return [];
   }
-  const candidates = (screened ?? []) as CandidateToken[];
+  let candidates = (screened ?? []) as CandidateToken[];
+  if (candidates.length === 0) return [];
+
+  const skipped = candidates.filter((c) => c.address in SKIPPED_MINTS);
+  if (skipped.length > 0) {
+    const names = skipped.map((c) => `${SKIPPED_MINTS[c.address]} (${c.address})`).join(", ");
+    // a deliberate, expected skip -- not a failure, so this goes to `notes`
+    // (still recorded in worker_status) rather than `errors` (which would
+    // mark the cycle as failed every run, forever, since these mints never
+    // leave v_screener).
+    notes.push(`skipped ${skipped.length} known large mint(s), holder concentration not meaningful: ${names}`);
+    candidates = candidates.filter((c) => !(c.address in SKIPPED_MINTS));
+  }
   if (candidates.length === 0) return [];
 
   const cutoff = new Date(Date.now() - STALE_AFTER_MS).toISOString();
@@ -219,6 +244,7 @@ async function processToken(token: CandidateToken, errors: string[]): Promise<vo
  */
 export async function runHoldersCycle(): Promise<void> {
   const errors: string[] = [];
+  const notes: string[] = [];
 
   if (!env.HELIUS_API_KEY) {
     errors.push("HELIUS_API_KEY not set");
@@ -227,7 +253,7 @@ export async function runHoldersCycle(): Promise<void> {
     return;
   }
 
-  const candidates = await selectCandidateTokens(errors);
+  const candidates = await selectCandidateTokens(errors, notes);
   const targets = candidates.slice(0, MAX_TOKENS_PER_RUN);
   console.log(
     `holders: ${candidates.length} tokens due for refresh, processing ${targets.length} (cap ${MAX_TOKENS_PER_RUN})`,
@@ -241,7 +267,15 @@ export async function runHoldersCycle(): Promise<void> {
     }
   }
 
-  await writeWorkerStatus(HOLDERS_WORKER_NAME, errors);
+  // notes (expected, deliberate skips) and errors (actual failures) both
+  // land in worker_status.last_error since that's the only text field
+  // available, but only errors affect the pass/fail log below -- a skip
+  // note alone shouldn't make every cycle read as failed.
+  await writeWorkerStatus(HOLDERS_WORKER_NAME, [...notes, ...errors]);
+
+  if (notes.length > 0) {
+    console.log(`holders: ${notes.length} note(s):`, notes);
+  }
 
   if (errors.length > 0) {
     console.error(`holders cycle completed with ${errors.length} error(s):`, errors);
