@@ -30,7 +30,7 @@ async function main(): Promise<void> {
     const discovered = await runPriceCycle();
     await runDexscreenerCycle(discovered.map((t) => t.address));
     await runJupiterCycle(await runRegistrySeed());
-    await runOhlcvCycle(discovered);
+    await runOhlcvCycle();
     await runHoldersCycle();
     return;
   }
@@ -49,7 +49,7 @@ async function main(): Promise<void> {
     await runJupiterCycle(await runRegistrySeed());
 
     if (startedAt - lastOhlcvAt >= OHLCV_INTERVAL_MS) {
-      await runOhlcvCycle(discovered);
+      await runOhlcvCycle();
       lastOhlcvAt = Date.now();
     }
 
