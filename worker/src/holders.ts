@@ -1,37 +1,20 @@
 import { supabase } from "./supabase.js";
 import { writeWorkerStatus } from "./workerStatus.js";
 import { env } from "./env.js";
-import {
-  fetchAccountOwner,
-  fetchTokenLargestAccounts,
-  fetchTokenSupply,
-  type LargestAccount,
-} from "./helius.js";
+import { fetchTokenInfo, fetchTopHolders } from "./blockscout.js";
+import { CHAIN, normalizeAddress } from "./chain.js";
 
-const CHAIN = "solana";
-export const HOLDERS_WORKER_NAME = "helius_holders";
+export const HOLDERS_WORKER_NAME = "blockscout_holders";
 const MAX_TOKENS_PER_RUN = 10;
+const TOP_HOLDERS = 20;
 const STALE_AFTER_MS = 6 * 60 * 60 * 1000;
-
-// getTokenLargestAccounts fails on these with "too many accounts requested"
-// (holder count is enormous), and holder concentration isn't a meaningful
-// signal for them anyway -- skip proactively instead of retrying and
-// failing every cycle.
-const SKIPPED_MINTS: Record<string, string> = {
-  So11111111111111111111111111111111111111112: "wrapped SOL",
-  EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v: "USDC",
-  Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB: "USDT",
-};
 
 interface CandidateToken {
   address: string;
   decimals: number | null;
 }
 
-async function selectCandidateTokens(
-  errors: string[],
-  notes: string[],
-): Promise<CandidateToken[]> {
+async function selectCandidateTokens(errors: string[]): Promise<CandidateToken[]> {
   const { data: screened, error: screenerError } = await supabase
     .from("v_screener")
     .select("address, decimals")
@@ -42,19 +25,7 @@ async function selectCandidateTokens(
     errors.push(`query v_screener: ${screenerError.message}`);
     return [];
   }
-  let candidates = (screened ?? []) as CandidateToken[];
-  if (candidates.length === 0) return [];
-
-  const skipped = candidates.filter((c) => c.address in SKIPPED_MINTS);
-  if (skipped.length > 0) {
-    const names = skipped.map((c) => `${SKIPPED_MINTS[c.address]} (${c.address})`).join(", ");
-    // a deliberate, expected skip -- not a failure, so this goes to `notes`
-    // (still recorded in worker_status) rather than `errors` (which would
-    // mark the cycle as failed every run, forever, since these mints never
-    // leave v_screener).
-    notes.push(`skipped ${skipped.length} known large mint(s), holder concentration not meaningful: ${names}`);
-    candidates = candidates.filter((c) => !(c.address in SKIPPED_MINTS));
-  }
+  const candidates = (screened ?? []) as CandidateToken[];
   if (candidates.length === 0) return [];
 
   const cutoff = new Date(Date.now() - STALE_AFTER_MS).toISOString();
@@ -78,126 +49,61 @@ async function selectCandidateTokens(
   return candidates.filter((c) => !fresh.has(c.address));
 }
 
-interface ResolvedAccount extends LargestAccount {
-  owner: string | null;
+/** raw / supply as a percentage, or null when supply is unknown or zero. */
+function percentOf(raw: bigint, totalSupplyRaw: bigint | null): number | null {
+  if (totalSupplyRaw === null || totalSupplyRaw <= 0n) return null;
+  // scale before dividing so bigint division keeps 1e-6 % precision.
+  return Number((raw * 100_000_000n) / totalSupplyRaw) / 1_000_000;
 }
 
-interface AggregatedHolder {
-  holderAddress: string | null; // resolved owner wallet, or null if unresolved
-  tokenAccount: string; // representative account -- see aggregateByOwner
-  amount: number;
-  decimals: number | null;
-}
-
-/**
- * Groups accounts that share a resolved owner, summing their balances (one
- * owner can hold several accounts for the same mint). Accounts whose owner
- * couldn't be resolved are kept as their own row with holderAddress null --
- * never merged into another owner's total or mislabeled as their own owner.
- * The representative tokenAccount for a merged owner is their single
- * largest individual account, just for having something concrete to show.
- */
-function aggregateByOwner(entries: ResolvedAccount[]): AggregatedHolder[] {
-  const byOwner = new Map<string, ResolvedAccount[]>();
-  const unresolved: ResolvedAccount[] = [];
-
-  for (const entry of entries) {
-    if (entry.amount === null) continue; // no amount to rank or sum
-    if (entry.owner) {
-      const group = byOwner.get(entry.owner) ?? [];
-      group.push(entry);
-      byOwner.set(entry.owner, group);
-    } else {
-      unresolved.push(entry);
-    }
-  }
-
-  const rows: AggregatedHolder[] = [];
-
-  for (const [owner, group] of byOwner) {
-    const total = group.reduce((sum, e) => sum + (e.amount as number), 0);
-    const representative = group.reduce((best, e) =>
-      (e.amount as number) > (best.amount as number) ? e : best,
-    );
-    rows.push({
-      holderAddress: owner,
-      tokenAccount: representative.address,
-      amount: total,
-      decimals: representative.decimals,
-    });
-  }
-
-  for (const entry of unresolved) {
-    rows.push({
-      holderAddress: null,
-      tokenAccount: entry.address,
-      amount: entry.amount as number,
-      decimals: entry.decimals,
-    });
-  }
-
-  rows.sort((a, b) => b.amount - a.amount);
-  return rows;
-}
-
-async function processToken(token: CandidateToken, errors: string[]): Promise<void> {
+async function processToken(token: CandidateToken, errors: string[], notes: string[]): Promise<void> {
   const { address } = token;
   const fetchedAt = new Date().toISOString();
 
-  const supply = await fetchTokenSupply(address).catch((err) => {
-    errors.push(`getTokenSupply ${address}: ${(err as Error).message}`);
-    return null;
-  });
-  const totalSupplyRaw = supply?.amount ?? null;
+  const info = await fetchTokenInfo(address);
+  // on evm, balances belong to wallets directly: no token accounts to
+  // resolve or aggregate, so each holder is one row keyed by its wallet.
+  const holders = await fetchTopHolders(address, TOP_HOLDERS);
+  const decimals = info.decimals ?? token.decimals ?? null;
 
-  // already sorted descending by the rpc spec, and already capped at 20 --
-  // there is no "top 100" here, getTokenLargestAccounts only ever returns 20.
-  const largest = await fetchTokenLargestAccounts(address);
-
-  // resolved sequentially, not in parallel: the shared throttle isn't safe
-  // against concurrent callers racing its lastCallAt check.
-  const resolved: ResolvedAccount[] = [];
-  for (const entry of largest) {
-    let owner: string | null = null;
-    try {
-      owner = await fetchAccountOwner(entry.address);
-    } catch (err) {
-      console.warn(
-        `holders: owner resolution failed for account ${entry.address} (mint ${address}): ${(err as Error).message}`,
-      );
-    }
-    resolved.push({ ...entry, owner });
+  // blockscout occasionally answers with an empty holders page for a token
+  // it reports holders for. treat that as a failed fetch and keep the
+  // previous snapshot, rather than clearing it and storing nothing.
+  if (holders.length === 0 && (info.holdersCount ?? 0) > 0) {
+    errors.push(`holders ${address}: empty holders page but holders_count=${info.holdersCount}; kept previous snapshot`);
+    return;
   }
 
-  const aggregated = aggregateByOwner(resolved);
+  // balances and total_supply both come from blockscout's index, and for
+  // some tokens they disagree (e.g. top holders summing to more than the
+  // reported supply). percentages from such a snapshot would be wrong --
+  // possibly over 100% -- so they're left null; balances are still stored.
+  const topSum = holders.reduce((sum, h) => sum + h.valueRaw, 0n);
+  const supplyConsistent = info.totalSupplyRaw !== null && topSum <= info.totalSupplyRaw;
+  const supplyForPercent = supplyConsistent ? info.totalSupplyRaw : null;
+  if (!supplyConsistent && info.totalSupplyRaw !== null) {
+    notes.push(`holders ${address}: top ${holders.length} sum exceeds blockscout total_supply; percentages left null`);
+  }
 
-  const percentOf = (rawAmount: number | null): number | null =>
-    rawAmount !== null && totalSupplyRaw && totalSupplyRaw > 0
-      ? (rawAmount / totalSupplyRaw) * 100
-      : null;
-
-  const holderRows = aggregated.map((row, i) => {
-    const decimals = row.decimals ?? supply?.decimals ?? token.decimals ?? null;
-    const balance = decimals !== null ? row.amount / 10 ** decimals : null;
-    return {
-      chain: CHAIN,
-      address,
-      holder_address: row.holderAddress,
-      token_account: row.tokenAccount,
-      balance,
-      percent_of_supply: percentOf(row.amount),
-      rank: i + 1,
-      source: HOLDERS_WORKER_NAME,
-      fetched_at: fetchedAt,
-    };
-  });
+  const holderRows = holders.map((h, i) => ({
+    chain: CHAIN,
+    address,
+    holder_address: normalizeAddress(h.address),
+    token_account: null,
+    balance: decimals !== null ? Number(h.valueRaw) / 10 ** decimals : null,
+    percent_of_supply: percentOf(h.valueRaw, supplyForPercent),
+    rank: i + 1,
+    source: HOLDERS_WORKER_NAME,
+    fetched_at: fetchedAt,
+  }));
 
   const sumPercent = (n: number): number | null => {
-    if (!totalSupplyRaw || totalSupplyRaw <= 0) return null;
-    const slice = aggregated.slice(0, n);
+    const slice = holders.slice(0, n);
     if (slice.length === 0) return null;
-    const rawSum = slice.reduce((sum, row) => sum + row.amount, 0);
-    return (rawSum / totalSupplyRaw) * 100;
+    return percentOf(
+      slice.reduce((sum, h) => sum + h.valueRaw, 0n),
+      supplyForPercent,
+    );
   };
 
   const { error: deleteError } = await supabase
@@ -221,9 +127,9 @@ async function processToken(token: CandidateToken, errors: string[]): Promise<vo
   const { error: statsError } = await supabase.from("token_holder_stats").insert({
     chain: CHAIN,
     address,
-    // getTokenLargestAccounts gives no way to know total holder count
-    // without pagination (which is what we're avoiding); not estimated.
-    holder_count: null,
+    // blockscout's own indexed count of addresses holding the token -- an
+    // exact count from the explorer's index, not an estimate.
+    holder_count: info.holdersCount,
     top10_percent: sumPercent(10),
     top20_percent: sumPercent(20),
     source: HOLDERS_WORKER_NAME,
@@ -236,41 +142,42 @@ async function processToken(token: CandidateToken, errors: string[]): Promise<vo
 
 /**
  * For up to MAX_TOKENS_PER_RUN tokens from v_screener with no risk_flag,
- * skipping any fetched in the last 6 hours, fetches the top 20 accounts by
- * balance via helius (getTokenLargestAccounts), resolves each account's
- * owner wallet, aggregates accounts under the same owner, and stores the
- * result plus concentration stats. holder_count is not tracked -- this
- * method has no way to know it.
+ * skipping any fetched in the last 6 hours, fetches the top 20 holders by
+ * balance from blockscout (robinhood chain's explorer) and stores them plus
+ * concentration stats and blockscout's holder count. 2 blockscout calls
+ * per token.
  */
 export async function runHoldersCycle(): Promise<void> {
   const errors: string[] = [];
+  // expected, per-token data caveats -- recorded, but don't fail the cycle.
   const notes: string[] = [];
 
-  if (!env.HELIUS_API_KEY) {
-    errors.push("HELIUS_API_KEY not set");
+  if (!env.BLOCKSCOUT_API_KEY) {
+    errors.push("BLOCKSCOUT_API_KEY not set");
     await writeWorkerStatus(HOLDERS_WORKER_NAME, errors);
-    console.error("holders cycle skipped: HELIUS_API_KEY not set");
+    console.error("holders cycle skipped: BLOCKSCOUT_API_KEY not set");
     return;
   }
 
-  const candidates = await selectCandidateTokens(errors, notes);
+  const candidates = await selectCandidateTokens(errors);
   const targets = candidates.slice(0, MAX_TOKENS_PER_RUN);
   console.log(
     `holders: ${candidates.length} tokens due for refresh, processing ${targets.length} (cap ${MAX_TOKENS_PER_RUN})`,
   );
 
+  let processed = 0;
   for (const token of targets) {
     try {
-      await processToken(token, errors);
+      await processToken(token, errors, notes);
+      processed++;
     } catch (err) {
       errors.push(`holders ${token.address}: ${(err as Error).message}`);
     }
   }
+  console.log(`holders: fetched ${processed} of ${targets.length} tokens`);
 
-  // notes (expected, deliberate skips) and errors (actual failures) both
-  // land in worker_status.last_error since that's the only text field
-  // available, but only errors affect the pass/fail log below -- a skip
-  // note alone shouldn't make every cycle read as failed.
+  // notes and errors both land in worker_status.last_error (the only text
+  // field), but only errors make the cycle read as failed below.
   await writeWorkerStatus(HOLDERS_WORKER_NAME, [...notes, ...errors]);
 
   if (notes.length > 0) {
