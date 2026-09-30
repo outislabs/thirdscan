@@ -90,6 +90,8 @@ async function processToken(token: CandidateToken, errors: string[], notes: stri
     address,
     holder_address: normalizeAddress(h.address),
     token_account: null,
+    is_contract: h.isContract,
+    label: h.label,
     balance: decimals !== null ? Number(h.valueRaw) / 10 ** decimals : null,
     percent_of_supply: percentOf(h.valueRaw, supplyForPercent),
     rank: i + 1,

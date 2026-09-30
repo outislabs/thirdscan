@@ -20,7 +20,12 @@ interface TokenResponse {
 
 interface HoldersResponse {
   items?: {
-    address?: { hash?: string | null } | null;
+    address?: {
+      hash?: string | null;
+      is_contract?: boolean | null;
+      name?: string | null;
+      ens_domain_name?: string | null;
+    } | null;
     value?: string | null;
   }[];
 }
@@ -34,6 +39,10 @@ export interface TokenInfo {
 export interface TokenHolder {
   address: string; // wallet (or contract) holding the token, as returned
   valueRaw: bigint; // balance in base units
+  isContract: boolean | null;
+  // blockscout's name for the address (verified contract name), else its
+  // ens name, else null.
+  label: string | null;
 }
 
 async function getJson<T>(path: string, label: string): Promise<T> {
@@ -81,7 +90,12 @@ export async function fetchTopHolders(address: string, limit: number): Promise<T
     const hash = item.address?.hash;
     const valueRaw = parseBigInt(item.value);
     if (!hash || valueRaw === null) continue;
-    holders.push({ address: hash, valueRaw });
+    holders.push({
+      address: hash,
+      valueRaw,
+      isContract: item.address?.is_contract ?? null,
+      label: item.address?.name || item.address?.ens_domain_name || null,
+    });
   }
   // sort defensively rather than trust the api ordering blindly.
   holders.sort((a, b) => (b.valueRaw > a.valueRaw ? 1 : b.valueRaw < a.valueRaw ? -1 : 0));
