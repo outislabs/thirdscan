@@ -133,15 +133,25 @@ async function insertTokenMetrics(
 
 /**
  * Fetches jupiter usd price, liquidity, and 24h price change for every
- * known solana token (not just this cycle's discovered set) and inserts
- * rows into token_metrics with source='jupiter'. volume_24h and market_cap
- * are always left null -- jupiter's v3 price endpoint doesn't return them.
+ * known solana token (not just this cycle's discovered set) plus every
+ * seeded registry mint, and inserts rows into token_metrics with
+ * source='jupiter'. volume_24h and market_cap are always left null --
+ * jupiter's v3 price endpoint doesn't return them.
+ *
+ * registryAddresses must already have tokens rows (see runRegistrySeed);
+ * the known-tokens set already covers every pool-discovered token that the
+ * price cycle managed to upsert. discovered addresses that didn't make it
+ * into tokens are deliberately excluded -- the token_metrics fk would
+ * reject the whole insert.
  */
-export async function runJupiterCycle(): Promise<void> {
+export async function runJupiterCycle(registryAddresses: string[] = []): Promise<void> {
   const errors: string[] = [];
 
-  const addresses = await selectAllKnownTokenAddresses(errors);
-  console.log(`jupiter: pricing ${addresses.length} known tokens`);
+  const known = await selectAllKnownTokenAddresses(errors);
+  const addresses = [...new Set([...known, ...registryAddresses])];
+  console.log(
+    `jupiter: pricing ${addresses.length} tokens (${known.length} known, ${registryAddresses.length} registry)`,
+  );
 
   const metrics = new Map<string, JupiterMetrics>();
   for (const batch of chunk(addresses, MINTS_PER_CALL)) {

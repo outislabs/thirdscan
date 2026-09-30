@@ -3,8 +3,10 @@ import { runOhlcvCycle } from "./ohlcv.js";
 import { runDexscreenerCycle } from "./dexscreener.js";
 import { runHoldersCycle } from "./holders.js";
 import { runJupiterCycle } from "./jupiter.js";
+import { runRegistrySeed } from "./registry.js";
 
 const ONCE = process.argv.includes("--once");
+const DRY_RUN = process.argv.includes("--dry-run");
 const PRICE_INTERVAL_MS = 5 * 60 * 1000;
 const OHLCV_INTERVAL_MS = 15 * 60 * 1000;
 // not specified by the original ask; matched to ohlcv's cadence since
@@ -17,10 +19,17 @@ function sleep(ms: number): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  // dry run exercises only the registry seed, read-only: every other job
+  // writes, so none of them run.
+  if (DRY_RUN) {
+    await runRegistrySeed({ dryRun: true });
+    return;
+  }
+
   if (ONCE) {
     const discovered = await runPriceCycle();
     await runDexscreenerCycle(discovered.map((t) => t.address));
-    await runJupiterCycle();
+    await runJupiterCycle(await runRegistrySeed());
     await runOhlcvCycle(discovered);
     await runHoldersCycle();
     return;
@@ -37,7 +46,7 @@ async function main(): Promise<void> {
     const startedAt = Date.now();
     const discovered = await runPriceCycle();
     await runDexscreenerCycle(discovered.map((t) => t.address));
-    await runJupiterCycle();
+    await runJupiterCycle(await runRegistrySeed());
 
     if (startedAt - lastOhlcvAt >= OHLCV_INTERVAL_MS) {
       await runOhlcvCycle(discovered);
