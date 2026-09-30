@@ -4,16 +4,21 @@ import { createThrottle } from "./rateLimiter.js";
 import { chunk } from "./geckoterminal.js";
 import { CHAIN, normalizeAddress } from "./chain.js";
 
-const BASE_URL = "https://api.dexscreener.com/latest/dex/tokens";
+const BASE_URL = "https://api.dexscreener.com/tokens/v1";
+// max addresses per tokens/v1 call.
+const ADDRESSES_PER_CALL = 30;
 export const DEXSCREENER_WORKER_NAME = "dexscreener";
 // keeps the `address=in.(...)` query string well under url length limits.
 const IMAGE_CHECK_CHUNK_SIZE = 100;
 
-// the multi-address form of this endpoint caps the total pairs returned
-// rather than guaranteeing coverage per address, so high-liquidity tokens
-// (stablecoins, wrapped SOL) crowd low-liquidity ones out of the response
-// entirely. querying one address at a time avoids that. its own throttle
-// runs independently of geckoterminal's, so the two never block each other.
+// batched via /tokens/v1/{chainId}/{addresses} (up to 30 per call), which
+// returns each token's pair(s) on that chain -- in practice one per token.
+// not /latest/dex/tokens/{addresses}: that form caps each response at 30
+// pairs *total*, and one liquid token (a stablecoin, weth) can have 30
+// pairs by itself, crowding everything else out. measured on robinhood
+// chain: 30 addresses/call there matched 72 of 255 tokens vs 208 one at a
+// time; tokens/v1 matched 209 in 9 calls. its own throttle runs
+// independently of geckoterminal's, so the two never block each other.
 const throttle = createThrottle(60);
 
 interface DexPair {
@@ -28,9 +33,8 @@ interface DexPair {
   info?: { imageUrl?: string | null } | null;
 }
 
-interface DexTokensResponse {
-  pairs: DexPair[] | null;
-}
+// tokens/v1 returns a bare array of pairs, not { pairs: [...] }.
+type DexTokensResponse = DexPair[];
 
 interface TokenMetricsRow {
   address: string;
@@ -60,25 +64,8 @@ function pickHighestLiquidityPair(pairs: DexPair[]): DexPair {
   });
 }
 
-async function fetchDexscreenerToken(address: string): Promise<DexscreenerResult | null> {
-  await throttle();
-  const url = `${BASE_URL}/${address}`;
-  const res = await fetch(url, { headers: { Accept: "application/json" } });
-  if (!res.ok) {
-    throw new Error(`GET ${url} -> ${res.status} ${res.statusText}`);
-  }
-  const json = (await res.json()) as DexTokensResponse;
-
-  // dexscreener returns eip-55 mixed-case addresses; tokens stores them
-  // lowercased, so compare case-insensitively.
-  const pairs = (json.pairs ?? []).filter(
-    (p) =>
-      p.chainId === CHAIN &&
-      p.baseToken?.address !== undefined &&
-      normalizeAddress(p.baseToken.address) === normalizeAddress(address),
-  );
+function toResult(address: string, pairs: DexPair[]): DexscreenerResult | null {
   if (pairs.length === 0) return null;
-
   const pair = pickHighestLiquidityPair(pairs);
   // the image belongs to the base token, not the pair, so any matching pair
   // that carries one will do if the top pair doesn't.
@@ -86,7 +73,7 @@ async function fetchDexscreenerToken(address: string): Promise<DexscreenerResult
     pair.info?.imageUrl || pairs.find((p) => p.info?.imageUrl)?.info?.imageUrl || null;
   return {
     metrics: {
-      address: normalizeAddress(address),
+      address,
       price_usd: parseNumeric(pair.priceUsd),
       volume_24h: parseNumeric(pair.volume?.h24),
       liquidity_usd: parseNumeric(pair.liquidity?.usd),
@@ -95,6 +82,40 @@ async function fetchDexscreenerToken(address: string): Promise<DexscreenerResult
     },
     imageUrl,
   };
+}
+
+/**
+ * Fetches up to 30 token addresses in one call and returns a result per
+ * address that has at least one CHAIN pair with it as the base token.
+ * pairs are grouped by base token case-insensitively: dexscreener returns
+ * eip-55 mixed-case addresses, tokens stores them lowercased.
+ */
+async function fetchDexscreenerBatch(addresses: string[]): Promise<Map<string, DexscreenerResult>> {
+  await throttle();
+  const url = `${BASE_URL}/${CHAIN}/${addresses.join(",")}`;
+  const res = await fetch(url, { headers: { Accept: "application/json" } });
+  if (!res.ok) {
+    throw new Error(`GET ${url} -> ${res.status} ${res.statusText}`);
+  }
+  const json = (await res.json()) as DexTokensResponse;
+
+  const wanted = new Set(addresses.map(normalizeAddress));
+  const pairsByAddress = new Map<string, DexPair[]>();
+  for (const p of Array.isArray(json) ? json : []) {
+    if (p.chainId !== CHAIN || p.baseToken?.address === undefined) continue;
+    const base = normalizeAddress(p.baseToken.address);
+    if (!wanted.has(base)) continue;
+    const list = pairsByAddress.get(base);
+    if (list) list.push(p);
+    else pairsByAddress.set(base, [p]);
+  }
+
+  const results = new Map<string, DexscreenerResult>();
+  for (const [address, pairs] of pairsByAddress) {
+    const result = toResult(address, pairs);
+    if (result) results.set(address, result);
+  }
+  return results;
 }
 
 /**
@@ -162,28 +183,33 @@ async function insertTokenMetrics(rows: TokenMetricsRow[], errors: string[]): Pr
 
 /**
  * Fetches dexscreener metrics for the given token addresses (the price
- * cycle's discovered set plus registry mints), one address per request, and inserts them
- * into token_metrics with source='dexscreener'. Picks each token's
- * highest-liquidity pair on CHAIN.
+ * cycle's discovered set plus registry mints), 30 addresses per request,
+ * and inserts them into token_metrics with source='dexscreener'. Picks
+ * each token's highest-liquidity pair on CHAIN.
  */
 export async function runDexscreenerCycle(addresses: string[]): Promise<void> {
   const errors: string[] = [];
   const rows: TokenMetricsRow[] = [];
   const imageUrls = new Map<string, string>();
 
-  for (const address of addresses) {
+  const unique = [...new Set(addresses.map(normalizeAddress))];
+  let calls = 0;
+  for (const batch of chunk(unique, ADDRESSES_PER_CALL)) {
+    calls++;
     try {
-      const result = await fetchDexscreenerToken(address);
-      if (result) {
+      for (const result of (await fetchDexscreenerBatch(batch)).values()) {
         rows.push(result.metrics);
         if (result.imageUrl) imageUrls.set(result.metrics.address, result.imageUrl);
       }
     } catch (err) {
-      errors.push(`dexscreener ${address}: ${(err as Error).message}`);
+      errors.push(`dexscreener batch [${batch[0]}..]: ${(err as Error).message}`);
     }
   }
 
-  console.log(`dexscreener: matched ${rows.length} of ${addresses.length} requested tokens`);
+  console.log(
+    `dexscreener: matched ${rows.length} of ${unique.length} requested tokens in ${calls} call(s) ` +
+      `(${ADDRESSES_PER_CALL} addresses/call)`,
+  );
   await insertTokenMetrics(rows, errors);
   const imagesSet = await fillMissingImageUrls(imageUrls, errors);
   console.log(
