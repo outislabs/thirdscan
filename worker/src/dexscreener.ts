@@ -161,8 +161,8 @@ async function insertTokenMetrics(rows: TokenMetricsRow[], errors: string[]): Pr
 }
 
 /**
- * Fetches dexscreener metrics for the given token addresses (same
- * token set as the price cycle), one address per request, and inserts them
+ * Fetches dexscreener metrics for the given token addresses (the price
+ * cycle's discovered set plus registry mints), one address per request, and inserts them
  * into token_metrics with source='dexscreener'. Picks each token's
  * highest-liquidity pair on CHAIN.
  */

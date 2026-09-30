@@ -3,6 +3,9 @@ import { runOhlcvCycle } from "./ohlcv.js";
 import { runDexscreenerCycle } from "./dexscreener.js";
 import { runRegistrySeed } from "./registry.js";
 import { CHAIN } from "./chain.js";
+import { supabase } from "./supabase.js";
+import { JUPITER_WORKER_NAME } from "./jupiter.js";
+import { HOLDERS_WORKER_NAME } from "./holders.js";
 
 const ONCE = process.argv.includes("--once");
 const DRY_RUN = process.argv.includes("--dry-run");
@@ -18,10 +21,32 @@ function sleep(ms: number): Promise<void> {
 // jupiter.ts / helius.ts / holders.ts, unchanged and still pinned to
 // 'solana', but none of it is called. re-enable by calling runJupiterCycle
 // / runHoldersCycle again from a solana run.
-function logPausedJobs(): void {
-  console.log(
-    `jupiter, helius holders: paused -- solana-only providers, worker is running chain=${CHAIN}`,
-  );
+const PAUSED_MESSAGE = `paused -- solana-only provider, worker is running chain=${CHAIN}`;
+
+/**
+ * Logs the paused jobs and records it on their worker_status rows so a
+ * status page shows "paused" instead of a silently stale last run. only
+ * last_error is written: last_run_at stays at the last real (solana) run,
+ * since these jobs haven't run since.
+ */
+async function markPausedJobs(): Promise<void> {
+  console.log(`jupiter, helius holders: ${PAUSED_MESSAGE}`);
+  const { error } = await supabase
+    .from("worker_status")
+    .update({ last_error: PAUSED_MESSAGE })
+    .in("worker_name", [JUPITER_WORKER_NAME, HOLDERS_WORKER_NAME]);
+  if (error) {
+    console.error(`failed to mark paused jobs in worker_status: ${error.message}`);
+  }
+}
+
+/**
+ * Discovered tokens plus every registry mint with a tokens row, deduped.
+ * registry mints mostly aren't in the top pools, so without this they'd
+ * never get a price (jupiter used to cover them; it's paused).
+ */
+function dexscreenerAddresses(discovered: { address: string }[], registry: string[]): string[] {
+  return [...new Set([...discovered.map((t) => t.address), ...registry])];
 }
 
 async function main(): Promise<void> {
@@ -33,11 +58,11 @@ async function main(): Promise<void> {
   }
 
   if (ONCE) {
+    await markPausedJobs();
     const discovered = await runPriceCycle();
-    await runDexscreenerCycle(discovered.map((t) => t.address));
-    await runRegistrySeed();
+    const registry = await runRegistrySeed();
+    await runDexscreenerCycle(dexscreenerAddresses(discovered, registry));
     await runOhlcvCycle();
-    logPausedJobs();
     return;
   }
 
@@ -46,13 +71,13 @@ async function main(): Promise<void> {
   // own, slower cadence, piggybacking on whichever price cycle crosses its
   // interval mark.
   let lastOhlcvAt = 0;
-  logPausedJobs();
+  await markPausedJobs();
 
   for (;;) {
     const startedAt = Date.now();
     const discovered = await runPriceCycle();
-    await runDexscreenerCycle(discovered.map((t) => t.address));
-    await runRegistrySeed();
+    const registry = await runRegistrySeed();
+    await runDexscreenerCycle(dexscreenerAddresses(discovered, registry));
 
     if (startedAt - lastOhlcvAt >= OHLCV_INTERVAL_MS) {
       await runOhlcvCycle();
