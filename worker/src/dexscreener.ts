@@ -1,10 +1,13 @@
 import { supabase } from "./supabase.js";
 import { writeWorkerStatus } from "./workerStatus.js";
 import { createThrottle } from "./rateLimiter.js";
+import { chunk } from "./geckoterminal.js";
 
 const BASE_URL = "https://api.dexscreener.com/latest/dex/tokens";
 const CHAIN = "solana";
 export const DEXSCREENER_WORKER_NAME = "dexscreener";
+// keeps the `address=in.(...)` query string well under url length limits.
+const IMAGE_CHECK_CHUNK_SIZE = 100;
 
 // the multi-address form of this endpoint caps the total pairs returned
 // rather than guaranteeing coverage per address, so high-liquidity tokens
@@ -22,6 +25,7 @@ interface DexPair {
   priceChange?: { h24?: number | null } | null;
   fdv?: number | null;
   marketCap?: number | null;
+  info?: { imageUrl?: string | null } | null;
 }
 
 interface DexTokensResponse {
@@ -35,6 +39,11 @@ interface TokenMetricsRow {
   liquidity_usd: number | null;
   market_cap: number | null;
   price_change_24h: number | null;
+}
+
+interface DexscreenerResult {
+  metrics: TokenMetricsRow;
+  imageUrl: string | null;
 }
 
 function parseNumeric(value: number | string | null | undefined): number | null {
@@ -51,7 +60,7 @@ function pickHighestLiquidityPair(pairs: DexPair[]): DexPair {
   });
 }
 
-async function fetchDexscreenerToken(address: string): Promise<TokenMetricsRow | null> {
+async function fetchDexscreenerToken(address: string): Promise<DexscreenerResult | null> {
   await throttle();
   const url = `${BASE_URL}/${address}`;
   const res = await fetch(url, { headers: { Accept: "application/json" } });
@@ -66,14 +75,61 @@ async function fetchDexscreenerToken(address: string): Promise<TokenMetricsRow |
   if (pairs.length === 0) return null;
 
   const pair = pickHighestLiquidityPair(pairs);
+  // the image belongs to the base token, not the pair, so any matching pair
+  // that carries one will do if the top pair doesn't.
+  const imageUrl =
+    pair.info?.imageUrl || pairs.find((p) => p.info?.imageUrl)?.info?.imageUrl || null;
   return {
-    address,
-    price_usd: parseNumeric(pair.priceUsd),
-    volume_24h: parseNumeric(pair.volume?.h24),
-    liquidity_usd: parseNumeric(pair.liquidity?.usd),
-    market_cap: parseNumeric(pair.marketCap) ?? parseNumeric(pair.fdv),
-    price_change_24h: parseNumeric(pair.priceChange?.h24),
+    metrics: {
+      address,
+      price_usd: parseNumeric(pair.priceUsd),
+      volume_24h: parseNumeric(pair.volume?.h24),
+      liquidity_usd: parseNumeric(pair.liquidity?.usd),
+      market_cap: parseNumeric(pair.marketCap) ?? parseNumeric(pair.fdv),
+      price_change_24h: parseNumeric(pair.priceChange?.h24),
+    },
+    imageUrl,
   };
+}
+
+/**
+ * Sets tokens.image_url from dexscreener, but only where it's currently
+ * null: registry logos are authoritative and existing values are never
+ * replaced or churned. tokens with no dexscreener image are left alone, so
+ * image_url is never set back to null.
+ */
+async function fillMissingImageUrls(imageUrls: Map<string, string>, errors: string[]): Promise<number> {
+  const needsImage: string[] = [];
+  for (const batch of chunk([...imageUrls.keys()], IMAGE_CHECK_CHUNK_SIZE)) {
+    const { data, error } = await supabase
+      .from("tokens")
+      .select("address")
+      .eq("chain", CHAIN)
+      .in("address", batch)
+      .is("image_url", null);
+    if (error) {
+      errors.push(`check tokens image_url: ${error.message}`);
+      return 0;
+    }
+    needsImage.push(...(data ?? []).map((row) => row.address as string));
+  }
+  if (needsImage.length === 0) return 0;
+
+  // rows already exist (they came from the query above), so this upsert
+  // only ever takes the update path, and only image_url changes.
+  const rows = needsImage.map((address) => ({
+    chain: CHAIN,
+    address,
+    image_url: imageUrls.get(address)!,
+  }));
+  const { error } = await supabase
+    .from("tokens")
+    .upsert(rows, { onConflict: "chain,address", ignoreDuplicates: false });
+  if (error) {
+    errors.push(`set image_url from dexscreener: ${error.message}`);
+    return 0;
+  }
+  return rows.length;
 }
 
 async function insertTokenMetrics(rows: TokenMetricsRow[], errors: string[]): Promise<void> {
@@ -108,11 +164,15 @@ async function insertTokenMetrics(rows: TokenMetricsRow[], errors: string[]): Pr
 export async function runDexscreenerCycle(addresses: string[]): Promise<void> {
   const errors: string[] = [];
   const rows: TokenMetricsRow[] = [];
+  const imageUrls = new Map<string, string>();
 
   for (const address of addresses) {
     try {
-      const row = await fetchDexscreenerToken(address);
-      if (row) rows.push(row);
+      const result = await fetchDexscreenerToken(address);
+      if (result) {
+        rows.push(result.metrics);
+        if (result.imageUrl) imageUrls.set(address, result.imageUrl);
+      }
     } catch (err) {
       errors.push(`dexscreener ${address}: ${(err as Error).message}`);
     }
@@ -120,6 +180,10 @@ export async function runDexscreenerCycle(addresses: string[]): Promise<void> {
 
   console.log(`dexscreener: matched ${rows.length} of ${addresses.length} requested tokens`);
   await insertTokenMetrics(rows, errors);
+  const imagesSet = await fillMissingImageUrls(imageUrls, errors);
+  console.log(
+    `dexscreener: ${imageUrls.size} tokens had an image, set image_url on ${imagesSet} that had none`,
+  );
   await writeWorkerStatus(DEXSCREENER_WORKER_NAME, errors);
 
   if (errors.length > 0) {

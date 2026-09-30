@@ -11,6 +11,8 @@ const EXISTS_CHUNK_SIZE = 100;
 interface RegistryMint {
   address: string;
   underlyingSymbol: string | null;
+  // raw_payload->>'logo' from the issuer's api payload.
+  logo: string | null;
 }
 
 async function selectRegistryMints(errors: string[]): Promise<RegistryMint[] | null> {
@@ -18,7 +20,7 @@ async function selectRegistryMints(errors: string[]): Promise<RegistryMint[] | n
   for (let from = 0; ; from += PAGE_SIZE) {
     const { data, error } = await supabase
       .from("rwa_issuers")
-      .select("mint_address, underlying_symbol")
+      .select("mint_address, underlying_symbol, logo:raw_payload->>logo")
       .eq("chain", CHAIN)
       .range(from, from + PAGE_SIZE - 1);
 
@@ -31,6 +33,7 @@ async function selectRegistryMints(errors: string[]): Promise<RegistryMint[] | n
       ...page.map((row) => ({
         address: row.mint_address as string,
         underlyingSymbol: (row.underlying_symbol as string | null) ?? null,
+        logo: (row.logo as string | null) || null,
       })),
     );
     if (page.length < PAGE_SIZE) break;
@@ -38,15 +41,16 @@ async function selectRegistryMints(errors: string[]): Promise<RegistryMint[] | n
   return mints;
 }
 
-async function selectExistingTokenAddresses(
+/** address -> current image_url, for the given addresses that exist in tokens. */
+async function selectExistingTokens(
   addresses: string[],
   errors: string[],
-): Promise<Set<string> | null> {
-  const existing = new Set<string>();
+): Promise<Map<string, string | null> | null> {
+  const existing = new Map<string, string | null>();
   for (const batch of chunk(addresses, EXISTS_CHUNK_SIZE)) {
     const { data, error } = await supabase
       .from("tokens")
-      .select("address")
+      .select("address, image_url")
       .eq("chain", CHAIN)
       .in("address", batch);
 
@@ -54,7 +58,9 @@ async function selectExistingTokenAddresses(
       errors.push(`query tokens: ${error.message}`);
       return null;
     }
-    for (const row of data ?? []) existing.add(row.address as string);
+    for (const row of data ?? []) {
+      existing.set(row.address as string, (row.image_url as string | null) ?? null);
+    }
   }
   return existing;
 }
@@ -74,6 +80,11 @@ export interface RegistrySeedOptions {
  * if the seed failed: token_metrics has an fk to tokens, so handing jupiter
  * an address with no tokens row would fail its whole insert.
  *
+ * Also sets image_url from the registry logo: on insert for new rows, and
+ * for existing rows whose image_url is null or differs (the registry is
+ * authoritative for its own mints). a missing logo never nulls out an
+ * existing image_url.
+ *
  * With dryRun, reads the registry and checks tokens as normal but writes
  * nothing (no upsert, no worker_status) -- it only logs the counts, and
  * returns just the mints that already exist in tokens.
@@ -84,15 +95,21 @@ export async function runRegistrySeed({ dryRun = false }: RegistrySeedOptions = 
   const registry = await selectRegistryMints(errors);
   const mints = registry?.map((m) => m.address) ?? null;
   const existing = mints && mints.length > 0
-    ? await selectExistingTokenAddresses(mints, errors)
-    : new Set<string>();
+    ? await selectExistingTokens(mints, errors)
+    : new Map<string, string | null>();
+
+  // existing rows whose image_url should change to the registry logo.
+  const logoUpdates = (registry ?? []).filter(
+    (m) => m.logo !== null && existing !== null && existing.has(m.address) && existing.get(m.address) !== m.logo,
+  );
 
   if (mints && existing) {
     const missing = mints.filter((address) => !existing.has(address));
     console.log(
       `registry${dryRun ? " (dry run)" : ""}: ${mints.length} registry mints read, ` +
         `${existing.size} already in tokens, ` +
-        `${missing.length} ${dryRun ? "would be" : "to be"} inserted`,
+        `${missing.length} ${dryRun ? "would be" : "to be"} inserted, ` +
+        `${logoUpdates.length} existing image_url(s) ${dryRun ? "would be" : "to be"} set from registry logo`,
     );
   }
 
@@ -111,6 +128,7 @@ export async function runRegistrySeed({ dryRun = false }: RegistrySeedOptions = 
       address: m.address,
       symbol: m.underlyingSymbol,
       discovery_source: "registry",
+      image_url: m.logo,
     }));
     // .select() returns only the rows actually inserted -- with
     // ignoreDuplicates, conflicting rows are skipped and not returned.
@@ -123,6 +141,20 @@ export async function runRegistrySeed({ dryRun = false }: RegistrySeedOptions = 
     } else {
       seeded = mints;
       console.log(`registry: inserted ${data?.length ?? 0} new tokens rows`);
+    }
+  }
+
+  if (logoUpdates.length > 0) {
+    // rows already exist (they came from the existence check), so this
+    // upsert only ever takes the update path, and only image_url changes.
+    const rows = logoUpdates.map((m) => ({ chain: CHAIN, address: m.address, image_url: m.logo }));
+    const { error } = await supabase
+      .from("tokens")
+      .upsert(rows, { onConflict: "chain,address", ignoreDuplicates: false });
+    if (error) {
+      errors.push(`set image_url from registry logo: ${error.message}`);
+    } else {
+      console.log(`registry: set image_url on ${rows.length} existing tokens rows`);
     }
   }
 
