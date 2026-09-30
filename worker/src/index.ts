@@ -1,21 +1,27 @@
 import { runPriceCycle } from "./ingest.js";
 import { runOhlcvCycle } from "./ohlcv.js";
 import { runDexscreenerCycle } from "./dexscreener.js";
-import { runHoldersCycle } from "./holders.js";
-import { runJupiterCycle } from "./jupiter.js";
 import { runRegistrySeed } from "./registry.js";
+import { CHAIN } from "./chain.js";
 
 const ONCE = process.argv.includes("--once");
 const DRY_RUN = process.argv.includes("--dry-run");
 const PRICE_INTERVAL_MS = 5 * 60 * 1000;
 const OHLCV_INTERVAL_MS = 15 * 60 * 1000;
-// not specified by the original ask; matched to ohlcv's cadence since
-// holders is similarly a slower, heavier job with its own staleness/cap
-// guards. adjust independently if helius load needs a different pace.
-const HOLDERS_INTERVAL_MS = 15 * 60 * 1000;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// jupiter (price + token icons) and helius (holders) only cover solana, and
+// the worker now runs robinhood chain only. their code is kept in
+// jupiter.ts / helius.ts / holders.ts, unchanged and still pinned to
+// 'solana', but none of it is called. re-enable by calling runJupiterCycle
+// / runHoldersCycle again from a solana run.
+function logPausedJobs(): void {
+  console.log(
+    `jupiter, helius holders: paused -- solana-only providers, worker is running chain=${CHAIN}`,
+  );
 }
 
 async function main(): Promise<void> {
@@ -29,33 +35,28 @@ async function main(): Promise<void> {
   if (ONCE) {
     const discovered = await runPriceCycle();
     await runDexscreenerCycle(discovered.map((t) => t.address));
-    await runJupiterCycle(await runRegistrySeed());
+    await runRegistrySeed();
     await runOhlcvCycle();
-    await runHoldersCycle();
+    logPausedJobs();
     return;
   }
 
   // run continuously, waiting out the interval between cycle *completions*
-  // so a slow cycle never overlaps with the next one. ohlcv and holders run
-  // on their own, slower cadence, piggybacking on whichever price cycle
-  // crosses their interval mark.
+  // so a slow cycle never overlaps with the next one. ohlcv runs on its
+  // own, slower cadence, piggybacking on whichever price cycle crosses its
+  // interval mark.
   let lastOhlcvAt = 0;
-  let lastHoldersAt = 0;
+  logPausedJobs();
 
   for (;;) {
     const startedAt = Date.now();
     const discovered = await runPriceCycle();
     await runDexscreenerCycle(discovered.map((t) => t.address));
-    await runJupiterCycle(await runRegistrySeed());
+    await runRegistrySeed();
 
     if (startedAt - lastOhlcvAt >= OHLCV_INTERVAL_MS) {
       await runOhlcvCycle();
       lastOhlcvAt = Date.now();
-    }
-
-    if (startedAt - lastHoldersAt >= HOLDERS_INTERVAL_MS) {
-      await runHoldersCycle();
-      lastHoldersAt = Date.now();
     }
 
     const elapsed = Date.now() - startedAt;

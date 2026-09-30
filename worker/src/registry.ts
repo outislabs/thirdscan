@@ -1,8 +1,8 @@
 import { supabase } from "./supabase.js";
 import { writeWorkerStatus } from "./workerStatus.js";
 import { chunk } from "./geckoterminal.js";
+import { CHAIN, normalizeAddress } from "./chain.js";
 
-const CHAIN = "solana";
 export const REGISTRY_WORKER_NAME = "registry_seed";
 const PAGE_SIZE = 1000;
 // keeps the `address=in.(...)` query string well under url length limits.
@@ -11,7 +11,9 @@ const EXISTS_CHUNK_SIZE = 100;
 interface RegistryMint {
   address: string;
   underlyingSymbol: string | null;
-  // raw_payload->>'logo' from the issuer's api payload.
+  // coalesce(logo_url, raw_payload->>'logo'): robinhood rows carry the
+  // logo in its own logo_url column; xstocks rows only have it in
+  // raw_payload.
   logo: string | null;
 }
 
@@ -20,7 +22,7 @@ async function selectRegistryMints(errors: string[]): Promise<RegistryMint[] | n
   for (let from = 0; ; from += PAGE_SIZE) {
     const { data, error } = await supabase
       .from("rwa_issuers")
-      .select("mint_address, underlying_symbol, logo:raw_payload->>logo")
+      .select("mint_address, underlying_symbol, logo_url, payload_logo:raw_payload->>logo")
       .eq("chain", CHAIN)
       .range(from, from + PAGE_SIZE - 1);
 
@@ -31,9 +33,9 @@ async function selectRegistryMints(errors: string[]): Promise<RegistryMint[] | n
     const page = data ?? [];
     mints.push(
       ...page.map((row) => ({
-        address: row.mint_address as string,
+        address: normalizeAddress(row.mint_address as string),
         underlyingSymbol: (row.underlying_symbol as string | null) ?? null,
-        logo: (row.logo as string | null) || null,
+        logo: (row.logo_url as string | null) || (row.payload_logo as string | null) || null,
       })),
     );
     if (page.length < PAGE_SIZE) break;
@@ -70,15 +72,15 @@ export interface RegistrySeedOptions {
 }
 
 /**
- * Ensures every solana mint in rwa_issuers has a tokens row, so registry
+ * Ensures every CHAIN mint in rwa_issuers has a tokens row, so registry
  * assets get priced even when they never show up in pool discovery. Inserts
  * chain + address, symbol (from the registry's underlying_symbol) and
  * discovery_source='registry', and never touches existing rows (on conflict
  * do nothing) -- name/decimals are left null for other sources to fill.
  *
  * Returns the registry mints that are guaranteed to exist in tokens, or []
- * if the seed failed: token_metrics has an fk to tokens, so handing jupiter
- * an address with no tokens row would fail its whole insert.
+ * if the seed failed: token_metrics has an fk to tokens, so any caller that
+ * prices these must only use addresses with a tokens row.
  *
  * Also sets image_url from the registry logo: on insert for new rows, and
  * for existing rows whose image_url is null or differs (the registry is

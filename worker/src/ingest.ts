@@ -1,8 +1,15 @@
 import { supabase } from "./supabase.js";
 import { writeWorkerStatus } from "./workerStatus.js";
-import { fetchPoolsPage, type DiscoveredToken } from "./geckoterminal.js";
+import {
+  chunk,
+  fetchPoolsPage,
+  fetchTokensMulti,
+  METRICS_CHUNK_SIZE,
+  type DiscoveredToken,
+  type TokenMetrics,
+} from "./geckoterminal.js";
+import { CHAIN, ZERO_ADDRESS } from "./chain.js";
 
-const CHAIN = "solana";
 const DISCOVER_PAGES = [1, 2, 3, 4, 5];
 const MAX_TOKENS = 100;
 export const PRICE_WORKER_NAME = "geckoterminal";
@@ -16,6 +23,7 @@ async function discoverTokens(errors: string[]): Promise<DiscoveredToken[]> {
     try {
       const entries = await fetchPoolsPage(page);
       for (const entry of entries) {
+        if (entry.address === ZERO_ADDRESS) continue;
         const existing = seen.get(entry.address);
         if (existing) {
           // keep the top pool, but take metadata from a later page if the
@@ -72,12 +80,49 @@ async function upsertTokens(discovered: DiscoveredToken[], errors: string[]): Pr
   }
 }
 
+async function fetchAllMetrics(addresses: string[], errors: string[]): Promise<TokenMetrics[]> {
+  const results: TokenMetrics[] = [];
+  for (const batch of chunk(addresses, METRICS_CHUNK_SIZE)) {
+    try {
+      results.push(...(await fetchTokensMulti(batch)));
+    } catch (err) {
+      errors.push(`metrics batch [${batch[0]}..]: ${(err as Error).message}`);
+    }
+  }
+  return results;
+}
+
+async function insertTokenMetrics(metrics: TokenMetrics[], errors: string[]): Promise<void> {
+  if (metrics.length === 0) return;
+  const fetchedAt = new Date().toISOString();
+  const rows = metrics.map((m) => ({
+    chain: CHAIN,
+    address: m.address,
+    price_usd: m.price_usd,
+    volume_24h: m.volume_24h,
+    liquidity_usd: m.liquidity_usd,
+    market_cap: m.market_cap,
+    price_change_24h: null,
+    source: PRICE_WORKER_NAME,
+    fetched_at: fetchedAt,
+    is_estimate: false,
+  }));
+  // plain insert, not upsert: accumulates alongside dexscreener's rows,
+  // never overwrites them.
+  const { error } = await supabase.from("token_metrics").insert(rows);
+  if (error) {
+    errors.push(`insert token_metrics: ${error.message}`);
+  }
+}
+
 /**
- * Runs geckoterminal pool discovery and upserts the discovered tokens (with
- * their top pool and metadata) into tokens. price/volume/liquidity/market
- * cap are no longer fetched from geckoterminal -- dexscreener and jupiter
- * cover them -- which leaves geckoterminal's rate limit to discovery and
- * ohlcv. returns the discovered tokens for dexscreener to price.
+ * Runs geckoterminal pool discovery, upserts the discovered tokens (with
+ * their top pool and metadata) into tokens, then fetches price / volume /
+ * liquidity / market cap for them via tokens/multi and inserts those into
+ * token_metrics with source='geckoterminal'. with jupiter paused (solana
+ * only), this is the second price source alongside dexscreener. metrics
+ * are inserted after the tokens upsert so the token_metrics fk holds.
+ * returns the discovered tokens for dexscreener to price.
  */
 export async function runPriceCycle(): Promise<DiscoveredToken[]> {
   const errors: string[] = [];
@@ -90,6 +135,11 @@ export async function runPriceCycle(): Promise<DiscoveredToken[]> {
   );
 
   await upsertTokens(discovered, errors);
+
+  const metrics = await fetchAllMetrics(discovered.map((t) => t.address), errors);
+  console.log(`fetched metrics for ${metrics.length} tokens`);
+  await insertTokenMetrics(metrics, errors);
+
   await writeWorkerStatus(PRICE_WORKER_NAME, errors);
 
   if (errors.length > 0) {

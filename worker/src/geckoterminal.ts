@@ -1,7 +1,9 @@
 import { createThrottle, sleep } from "./rateLimiter.js";
+import { GECKOTERMINAL_NETWORK, normalizeAddress } from "./chain.js";
 
 const BASE_URL = "https://api.geckoterminal.com/api/v2";
-const NETWORK = "solana";
+const NETWORK = GECKOTERMINAL_NETWORK;
+const MAX_ADDRESSES_PER_METRICS_CALL = 30;
 const MAX_429_RETRIES = 3;
 const RETRY_BACKOFF_MS = [15_000, 30_000, 60_000];
 
@@ -39,6 +41,29 @@ interface OhlcvResponse {
   };
 }
 
+interface TokensMultiResponse {
+  data: {
+    attributes: {
+      address: string;
+      name: string | null;
+      symbol: string | null;
+      decimals: number | null;
+      price_usd: string | null;
+      volume_usd?: { h24?: string | null } | null;
+      total_reserve_in_usd: string | null;
+      market_cap_usd: string | null;
+    };
+  }[];
+}
+
+export interface TokenMetrics {
+  address: string;
+  price_usd: number | null;
+  volume_24h: number | null;
+  liquidity_usd: number | null;
+  market_cap: number | null;
+}
+
 export interface TokenMetadata {
   symbol: string | null;
   name: string | null;
@@ -60,6 +85,12 @@ export interface OhlcvCandle {
   low: number | null;
   close: number | null;
   volume_usd: number | null;
+}
+
+function parseNumeric(value: string | null | undefined): number | null {
+  if (value === null || value === undefined) return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
 }
 
 async function getJson<T>(url: string): Promise<T> {
@@ -93,13 +124,13 @@ async function getJson<T>(url: string): Promise<T> {
 }
 
 function stripNetworkPrefix(id: string): string | null {
-  // ids are formatted "<network>_<address>", e.g. "solana_So1111...".
+  // ids are formatted "<network>_<address>", e.g. "robinhood_0x5fc5...".
   const prefix = `${NETWORK}_`;
-  return id.startsWith(prefix) ? id.slice(prefix.length) : null;
+  return id.startsWith(prefix) ? normalizeAddress(id.slice(prefix.length)) : null;
 }
 
 /**
- * Fetches one page of the top solana pools by 24h volume and returns the
+ * Fetches one page of the top pools by 24h volume and returns the
  * base token address + pool address pairs referenced on that page, with
  * each base token's symbol/name/decimals from the same response
  * (include=base_token) -- no separate per-token metadata call.
@@ -113,7 +144,7 @@ export async function fetchPoolsPage(page: number): Promise<DiscoveredToken[]> {
   const metadataById = new Map<string, TokenMetadata>();
   for (const entry of json.included ?? []) {
     if (entry.type !== "token" || !entry.id) continue;
-    metadataById.set(entry.id, {
+    metadataById.set(normalizeAddress(entry.id), {
       symbol: entry.attributes?.symbol ?? null,
       name: entry.attributes?.name ?? null,
       decimals: entry.attributes?.decimals ?? null,
@@ -128,7 +159,11 @@ export async function fetchPoolsPage(page: number): Promise<DiscoveredToken[]> {
     const address = stripNetworkPrefix(baseTokenId);
     const poolAddress = stripNetworkPrefix(poolId);
     if (!address || !poolAddress) continue;
-    results.push({ address, poolAddress, metadata: metadataById.get(baseTokenId) ?? null });
+    results.push({
+      address,
+      poolAddress,
+      metadata: metadataById.get(normalizeAddress(baseTokenId)) ?? null,
+    });
   }
   return results;
 }
@@ -140,6 +175,31 @@ export function chunk<T>(items: T[], size: number): T[][] {
   }
   return chunks;
 }
+
+/**
+ * Fetches price, 24h volume, reserve (liquidity) and market cap for up to
+ * 30 token addresses in a single call. metadata is not returned here --
+ * pool discovery already supplies it.
+ */
+export async function fetchTokensMulti(addresses: string[]): Promise<TokenMetrics[]> {
+  if (addresses.length === 0) return [];
+  if (addresses.length > MAX_ADDRESSES_PER_METRICS_CALL) {
+    throw new Error(
+      `fetchTokensMulti: ${addresses.length} addresses exceeds max of ${MAX_ADDRESSES_PER_METRICS_CALL}`,
+    );
+  }
+  const url = `${BASE_URL}/networks/${NETWORK}/tokens/multi/${addresses.join(",")}`;
+  const json = await getJson<TokensMultiResponse>(url);
+  return (json.data ?? []).map((entry) => ({
+    address: normalizeAddress(entry.attributes.address),
+    price_usd: parseNumeric(entry.attributes.price_usd),
+    volume_24h: parseNumeric(entry.attributes.volume_usd?.h24),
+    liquidity_usd: parseNumeric(entry.attributes.total_reserve_in_usd),
+    market_cap: parseNumeric(entry.attributes.market_cap_usd),
+  }));
+}
+
+export const METRICS_CHUNK_SIZE = MAX_ADDRESSES_PER_METRICS_CALL;
 
 const OHLCV_TIMEFRAME = "hour";
 const OHLCV_AGGREGATE = 1;

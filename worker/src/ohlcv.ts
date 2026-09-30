@@ -1,8 +1,8 @@
 import { supabase } from "./supabase.js";
 import { writeWorkerStatus } from "./workerStatus.js";
 import { fetchPoolOhlcvHourly } from "./geckoterminal.js";
+import { CHAIN } from "./chain.js";
 
-const CHAIN = "solana";
 export const OHLCV_WORKER_NAME = "geckoterminal_ohlcv";
 const MAX_TOKENS_PER_RUN = 50;
 const STALE_AFTER_MS = 60 * 60 * 1000;

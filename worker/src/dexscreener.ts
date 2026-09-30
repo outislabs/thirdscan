@@ -2,9 +2,9 @@ import { supabase } from "./supabase.js";
 import { writeWorkerStatus } from "./workerStatus.js";
 import { createThrottle } from "./rateLimiter.js";
 import { chunk } from "./geckoterminal.js";
+import { CHAIN, normalizeAddress } from "./chain.js";
 
 const BASE_URL = "https://api.dexscreener.com/latest/dex/tokens";
-const CHAIN = "solana";
 export const DEXSCREENER_WORKER_NAME = "dexscreener";
 // keeps the `address=in.(...)` query string well under url length limits.
 const IMAGE_CHECK_CHUNK_SIZE = 100;
@@ -69,8 +69,13 @@ async function fetchDexscreenerToken(address: string): Promise<DexscreenerResult
   }
   const json = (await res.json()) as DexTokensResponse;
 
+  // dexscreener returns eip-55 mixed-case addresses; tokens stores them
+  // lowercased, so compare case-insensitively.
   const pairs = (json.pairs ?? []).filter(
-    (p) => p.chainId === CHAIN && p.baseToken?.address === address,
+    (p) =>
+      p.chainId === CHAIN &&
+      p.baseToken?.address !== undefined &&
+      normalizeAddress(p.baseToken.address) === normalizeAddress(address),
   );
   if (pairs.length === 0) return null;
 
@@ -81,7 +86,7 @@ async function fetchDexscreenerToken(address: string): Promise<DexscreenerResult
     pair.info?.imageUrl || pairs.find((p) => p.info?.imageUrl)?.info?.imageUrl || null;
   return {
     metrics: {
-      address,
+      address: normalizeAddress(address),
       price_usd: parseNumeric(pair.priceUsd),
       volume_24h: parseNumeric(pair.volume?.h24),
       liquidity_usd: parseNumeric(pair.liquidity?.usd),
@@ -156,10 +161,10 @@ async function insertTokenMetrics(rows: TokenMetricsRow[], errors: string[]): Pr
 }
 
 /**
- * Fetches dexscreener metrics for the given solana token addresses (same
+ * Fetches dexscreener metrics for the given token addresses (same
  * token set as the price cycle), one address per request, and inserts them
  * into token_metrics with source='dexscreener'. Picks each token's
- * highest-liquidity solana pair.
+ * highest-liquidity pair on CHAIN.
  */
 export async function runDexscreenerCycle(addresses: string[]): Promise<void> {
   const errors: string[] = [];
@@ -171,7 +176,7 @@ export async function runDexscreenerCycle(addresses: string[]): Promise<void> {
       const result = await fetchDexscreenerToken(address);
       if (result) {
         rows.push(result.metrics);
-        if (result.imageUrl) imageUrls.set(address, result.imageUrl);
+        if (result.imageUrl) imageUrls.set(result.metrics.address, result.imageUrl);
       }
     } catch (err) {
       errors.push(`dexscreener ${address}: ${(err as Error).message}`);
