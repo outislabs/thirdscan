@@ -9,12 +9,19 @@ export const JUPITER_WORKER_NAME = "jupiter";
 const MINTS_PER_CALL = 50;
 const PAGE_SIZE = 1000;
 
-const PRIMARY_BASE = "https://api.jup.ag/price/v3";
-const FALLBACK_BASE = "https://lite-api.jup.ag/price/v3";
+const PRIMARY_HOST = "https://api.jup.ag";
+const FALLBACK_HOST = "https://lite-api.jup.ag";
+const PRICE_PATH = "/price/v3";
+// token search takes a comma-separated list of mints and returns one entry
+// per mint it knows, including its icon url.
+const TOKENS_PATH = "/tokens/v2/search";
+// keeps the `address=in.(...)` query string well under url length limits.
+const IMAGE_CHECK_CHUNK_SIZE = 100;
 
 // keyless, so this stays comfortably under 50/min regardless of whether a
 // key is set; the primary/fallback split doesn't get its own budget since
 // a fallback replaces the primary call for that batch, not adds to it.
+// price and token-icon calls share this one budget.
 const throttle = createThrottle(50);
 
 interface PriceEntry {
@@ -24,6 +31,8 @@ interface PriceEntry {
 }
 
 type PriceResponse = Record<string, PriceEntry | null | undefined>;
+
+type TokenSearchResponse = { id?: string; icon?: string | null }[];
 
 interface JupiterMetrics {
   price_usd: number | null;
@@ -36,36 +45,41 @@ function parseNumeric(value: number | null | undefined): number | null {
   return Number.isFinite(value) ? value : null;
 }
 
-async function requestPrices(base: string, addresses: string[], apiKey: string | null) {
+async function request(host: string, pathAndQuery: string, apiKey: string | null) {
   await throttle();
-  const url = `${base}?ids=${addresses.join(",")}`;
   const headers: Record<string, string> = { Accept: "application/json" };
   if (apiKey) headers["x-api-key"] = apiKey;
-  return fetch(url, { headers });
+  return fetch(`${host}${pathAndQuery}`, { headers });
 }
 
 /**
- * Fetches usd price, liquidity, and 24h price change for up to 50 mints.
- * If JUP_API_KEY is set, tries api.jup.ag first and falls back to the
- * keyless lite-api.jup.ag on 401/403/429 (unauthorized/forbidden/rate
- * limited) for that same batch. Without a key, goes straight to lite-api.
+ * GETs a jupiter endpoint. If JUP_API_KEY is set, tries api.jup.ag first
+ * and falls back to the keyless lite-api.jup.ag on 401/403/429
+ * (unauthorized/forbidden/rate limited) for that same call. Without a key,
+ * goes straight to lite-api.
  */
-async function fetchJupiterBatch(addresses: string[]): Promise<Map<string, JupiterMetrics>> {
-  let res = await requestPrices(
-    env.JUP_API_KEY ? PRIMARY_BASE : FALLBACK_BASE,
-    addresses,
+async function jupiterGet<T>(pathAndQuery: string, label: string): Promise<T> {
+  let res = await request(
+    env.JUP_API_KEY ? PRIMARY_HOST : FALLBACK_HOST,
+    pathAndQuery,
     env.JUP_API_KEY,
   );
 
   if (env.JUP_API_KEY && [401, 403, 429].includes(res.status)) {
-    res = await requestPrices(FALLBACK_BASE, addresses, null);
+    res = await request(FALLBACK_HOST, pathAndQuery, null);
   }
 
   if (!res.ok) {
-    throw new Error(`GET jupiter price -> ${res.status} ${res.statusText}`);
+    throw new Error(`GET jupiter ${label} -> ${res.status} ${res.statusText}`);
   }
+  return (await res.json()) as T;
+}
 
-  const json = (await res.json()) as PriceResponse;
+/**
+ * Fetches usd price, liquidity, and 24h price change for up to 50 mints.
+ */
+async function fetchJupiterBatch(addresses: string[]): Promise<Map<string, JupiterMetrics>> {
+  const json = await jupiterGet<PriceResponse>(`${PRICE_PATH}?ids=${addresses.join(",")}`, "price");
   const results = new Map<string, JupiterMetrics>();
   for (const address of addresses) {
     const entry = json[address];
@@ -132,6 +146,98 @@ async function insertTokenMetrics(
 }
 
 /**
+ * Fetches icon urls for up to 50 mints. mints jupiter doesn't know, or
+ * knows without an icon, are simply absent from the result.
+ */
+async function fetchJupiterIcons(addresses: string[]): Promise<Map<string, string>> {
+  const json = await jupiterGet<TokenSearchResponse>(
+    `${TOKENS_PATH}?query=${addresses.join(",")}`,
+    "tokens",
+  );
+  const wanted = new Set(addresses);
+  const icons = new Map<string, string>();
+  for (const entry of json ?? []) {
+    if (entry.id && entry.icon && wanted.has(entry.id)) icons.set(entry.id, entry.icon);
+  }
+  return icons;
+}
+
+async function selectTokensWithoutImage(errors: string[]): Promise<string[]> {
+  const addresses: string[] = [];
+  for (let from = 0; ; from += PAGE_SIZE) {
+    const { data, error } = await supabase
+      .from("tokens")
+      .select("address")
+      .eq("chain", CHAIN)
+      .is("image_url", null)
+      .order("address")
+      .range(from, from + PAGE_SIZE - 1);
+
+    if (error) {
+      errors.push(`query tokens without image_url: ${error.message}`);
+      break;
+    }
+    const page = data ?? [];
+    addresses.push(...page.map((row) => row.address as string));
+    if (page.length < PAGE_SIZE) break;
+  }
+  return addresses;
+}
+
+/**
+ * Lowest-precedence image source: registry logos, then dexscreener, then
+ * jupiter. runs after both of those in the cycle and only ever fills
+ * image_url where it is still null -- re-checked right before the write,
+ * so it can't overwrite a value set since the candidate list was read.
+ * mints without a jupiter icon are left alone, so nothing is set to null.
+ */
+async function fillMissingImageUrls(errors: string[]): Promise<void> {
+  const candidates = await selectTokensWithoutImage(errors);
+  const icons = new Map<string, string>();
+  for (const batch of chunk(candidates, MINTS_PER_CALL)) {
+    try {
+      for (const [address, icon] of await fetchJupiterIcons(batch)) icons.set(address, icon);
+    } catch (err) {
+      errors.push(`jupiter tokens batch [${batch[0]}..]: ${(err as Error).message}`);
+    }
+  }
+
+  let set = 0;
+  for (const batch of chunk([...icons.keys()], IMAGE_CHECK_CHUNK_SIZE)) {
+    const { data, error } = await supabase
+      .from("tokens")
+      .select("address")
+      .eq("chain", CHAIN)
+      .in("address", batch)
+      .is("image_url", null);
+    if (error) {
+      errors.push(`check tokens image_url: ${error.message}`);
+      continue;
+    }
+    const rows = (data ?? []).map((row) => ({
+      chain: CHAIN,
+      address: row.address as string,
+      image_url: icons.get(row.address as string)!,
+    }));
+    if (rows.length === 0) continue;
+    // rows already exist (they came from the query above), so this upsert
+    // only ever takes the update path, and only image_url changes.
+    const { error: upsertError } = await supabase
+      .from("tokens")
+      .upsert(rows, { onConflict: "chain,address", ignoreDuplicates: false });
+    if (upsertError) {
+      errors.push(`set image_url from jupiter: ${upsertError.message}`);
+      continue;
+    }
+    set += rows.length;
+  }
+
+  console.log(
+    `jupiter: ${candidates.length} tokens without image_url, found ${icons.size} icons, set image_url on ${set}`,
+  );
+}
+
+/**
  * Fetches jupiter usd price, liquidity, and 24h price change for every
  * known solana token (not just this cycle's discovered set) plus every
  * seeded registry mint, and inserts rows into token_metrics with
@@ -143,6 +249,9 @@ async function insertTokenMetrics(
  * price cycle managed to upsert. discovered addresses that didn't make it
  * into tokens are deliberately excluded -- the token_metrics fk would
  * reject the whole insert.
+ *
+ * then fills any still-null tokens.image_url from jupiter's token icons
+ * (see fillMissingImageUrls).
  */
 export async function runJupiterCycle(registryAddresses: string[] = []): Promise<void> {
   const errors: string[] = [];
@@ -172,6 +281,7 @@ export async function runJupiterCycle(registryAddresses: string[] = []): Promise
   }
 
   await insertTokenMetrics(metrics, errors);
+  await fillMissingImageUrls(errors);
   await writeWorkerStatus(JUPITER_WORKER_NAME, errors);
 
   if (errors.length > 0) {
