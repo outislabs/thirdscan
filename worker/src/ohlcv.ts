@@ -163,7 +163,15 @@ export async function runOhlcvCycle(): Promise<void> {
       continue;
     }
 
-    const rows = candles.map((c) => ({
+    // geckoterminal occasionally returns the same ts twice in one response,
+    // and a single upsert can't touch the same (chain, address, ts) row
+    // twice. keep the last occurrence of each ts (map.set overwrites).
+    const byTs = new Map(candles.map((c) => [c.ts, c]));
+    if (byTs.size < candles.length) {
+      console.warn(`ohlcv ${address}: dropped ${candles.length - byTs.size} duplicate-ts candle(s)`);
+    }
+
+    const rows = [...byTs.values()].map((c) => ({
       chain: CHAIN,
       address,
       ts: c.ts,

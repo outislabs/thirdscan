@@ -149,8 +149,14 @@ export async function runJupiterCycle(registryAddresses: string[] = []): Promise
 
   const known = await selectAllKnownTokenAddresses(errors);
   const addresses = [...new Set([...known, ...registryAddresses])];
+  const knownSet = new Set(known);
+  const registryInKnown = registryAddresses.filter((a) => knownSet.has(a)).length;
+  const registryExtra = registryAddresses.length - registryInKnown;
   console.log(
-    `jupiter: pricing ${addresses.length} tokens (${known.length} known, ${registryAddresses.length} registry)`,
+    `jupiter: pricing ${addresses.length} tokens (${known.length} known, ` +
+      `of which ${registryInKnown} are registry mints` +
+      (registryExtra > 0 ? `; plus ${registryExtra} registry mints not in the known set` : "") +
+      ")",
   );
 
   const metrics = new Map<string, JupiterMetrics>();
