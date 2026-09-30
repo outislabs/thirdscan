@@ -2,7 +2,6 @@ import { createThrottle, sleep } from "./rateLimiter.js";
 
 const BASE_URL = "https://api.geckoterminal.com/api/v2";
 const NETWORK = "solana";
-const MAX_ADDRESSES_PER_METRICS_CALL = 30;
 const MAX_429_RETRIES = 3;
 const RETRY_BACKOFF_MS = [15_000, 30_000, 60_000];
 
@@ -19,6 +18,17 @@ interface PoolsResponse {
       };
     };
   }[];
+  // present when requested with include=base_token: one entry per distinct
+  // base token on the page, keyed by the same "<network>_<address>" id.
+  included?: {
+    id?: string;
+    type?: string;
+    attributes?: {
+      name?: string | null;
+      symbol?: string | null;
+      decimals?: number | null;
+    };
+  }[];
 }
 
 interface OhlcvResponse {
@@ -29,35 +39,18 @@ interface OhlcvResponse {
   };
 }
 
-interface TokensMultiResponse {
-  data: {
-    attributes: {
-      address: string;
-      name: string | null;
-      symbol: string | null;
-      decimals: number | null;
-      price_usd: string | null;
-      volume_usd?: { h24?: string | null } | null;
-      total_reserve_in_usd: string | null;
-      market_cap_usd: string | null;
-    };
-  }[];
-}
-
-export interface TokenMetrics {
-  address: string;
+export interface TokenMetadata {
   symbol: string | null;
   name: string | null;
   decimals: number | null;
-  price_usd: number | null;
-  volume_24h: number | null;
-  liquidity_usd: number | null;
-  market_cap: number | null;
 }
 
 export interface DiscoveredToken {
   address: string;
   poolAddress: string;
+  // null when the page's included base_token entry was missing for this
+  // token -- callers must not overwrite stored metadata with it.
+  metadata: TokenMetadata | null;
 }
 
 export interface OhlcvCandle {
@@ -67,12 +60,6 @@ export interface OhlcvCandle {
   low: number | null;
   close: number | null;
   volume_usd: number | null;
-}
-
-function parseNumeric(value: string | null | undefined): number | null {
-  if (value === null || value === undefined) return null;
-  const n = Number(value);
-  return Number.isFinite(n) ? n : null;
 }
 
 async function getJson<T>(url: string): Promise<T> {
@@ -113,11 +100,26 @@ function stripNetworkPrefix(id: string): string | null {
 
 /**
  * Fetches one page of the top solana pools by 24h volume and returns the
- * base token address + pool address pairs referenced on that page.
+ * base token address + pool address pairs referenced on that page, with
+ * each base token's symbol/name/decimals from the same response
+ * (include=base_token) -- no separate per-token metadata call.
  */
 export async function fetchPoolsPage(page: number): Promise<DiscoveredToken[]> {
-  const url = `${BASE_URL}/networks/${NETWORK}/pools?sort=h24_volume_usd_desc&page=${page}`;
+  const url =
+    `${BASE_URL}/networks/${NETWORK}/pools?sort=h24_volume_usd_desc&page=${page}` +
+    `&include=base_token`;
   const json = await getJson<PoolsResponse>(url);
+
+  const metadataById = new Map<string, TokenMetadata>();
+  for (const entry of json.included ?? []) {
+    if (entry.type !== "token" || !entry.id) continue;
+    metadataById.set(entry.id, {
+      symbol: entry.attributes?.symbol ?? null,
+      name: entry.attributes?.name ?? null,
+      decimals: entry.attributes?.decimals ?? null,
+    });
+  }
+
   const results: DiscoveredToken[] = [];
   for (const pool of json.data ?? []) {
     const baseTokenId = pool.relationships?.base_token?.data?.id;
@@ -126,7 +128,7 @@ export async function fetchPoolsPage(page: number): Promise<DiscoveredToken[]> {
     const address = stripNetworkPrefix(baseTokenId);
     const poolAddress = stripNetworkPrefix(poolId);
     if (!address || !poolAddress) continue;
-    results.push({ address, poolAddress });
+    results.push({ address, poolAddress, metadata: metadataById.get(baseTokenId) ?? null });
   }
   return results;
 }
@@ -138,32 +140,6 @@ export function chunk<T>(items: T[], size: number): T[][] {
   }
   return chunks;
 }
-
-/**
- * Fetches metrics for up to 30 token addresses in a single call.
- */
-export async function fetchTokensMulti(addresses: string[]): Promise<TokenMetrics[]> {
-  if (addresses.length === 0) return [];
-  if (addresses.length > MAX_ADDRESSES_PER_METRICS_CALL) {
-    throw new Error(
-      `fetchTokensMulti: ${addresses.length} addresses exceeds max of ${MAX_ADDRESSES_PER_METRICS_CALL}`,
-    );
-  }
-  const url = `${BASE_URL}/networks/${NETWORK}/tokens/multi/${addresses.join(",")}`;
-  const json = await getJson<TokensMultiResponse>(url);
-  return (json.data ?? []).map((entry) => ({
-    address: entry.attributes.address,
-    symbol: entry.attributes.symbol,
-    name: entry.attributes.name,
-    decimals: entry.attributes.decimals,
-    price_usd: parseNumeric(entry.attributes.price_usd),
-    volume_24h: parseNumeric(entry.attributes.volume_usd?.h24),
-    liquidity_usd: parseNumeric(entry.attributes.total_reserve_in_usd),
-    market_cap: parseNumeric(entry.attributes.market_cap_usd),
-  }));
-}
-
-export const METRICS_CHUNK_SIZE = MAX_ADDRESSES_PER_METRICS_CALL;
 
 const OHLCV_TIMEFRAME = "hour";
 const OHLCV_AGGREGATE = 1;

@@ -1,13 +1,6 @@
 import { supabase } from "./supabase.js";
 import { writeWorkerStatus } from "./workerStatus.js";
-import {
-  chunk,
-  fetchPoolsPage,
-  fetchTokensMulti,
-  METRICS_CHUNK_SIZE,
-  type DiscoveredToken,
-  type TokenMetrics,
-} from "./geckoterminal.js";
+import { fetchPoolsPage, type DiscoveredToken } from "./geckoterminal.js";
 
 const CHAIN = "solana";
 const DISCOVER_PAGES = [1, 2, 3, 4, 5];
@@ -15,102 +8,88 @@ const MAX_TOKENS = 100;
 export const PRICE_WORKER_NAME = "geckoterminal";
 
 async function discoverTokens(errors: string[]): Promise<DiscoveredToken[]> {
-  // address -> pool address, first-seen wins (pages are sorted by desc 24h
-  // volume, so the first pool a token appears in is its top pool).
-  const seen = new Map<string, string>();
+  // address -> discovered token, first-seen pool wins (pages are sorted by
+  // desc 24h volume, so the first pool a token appears in is its top pool).
+  const seen = new Map<string, DiscoveredToken>();
   for (const page of DISCOVER_PAGES) {
     if (seen.size >= MAX_TOKENS) break;
     try {
       const entries = await fetchPoolsPage(page);
-      for (const { address, poolAddress } of entries) {
-        if (!seen.has(address)) {
-          if (seen.size >= MAX_TOKENS) break;
-          seen.set(address, poolAddress);
+      for (const entry of entries) {
+        const existing = seen.get(entry.address);
+        if (existing) {
+          // keep the top pool, but take metadata from a later page if the
+          // first one's included entry was missing.
+          if (!existing.metadata && entry.metadata) existing.metadata = entry.metadata;
+          continue;
         }
+        if (seen.size >= MAX_TOKENS) break;
+        seen.set(entry.address, { ...entry });
       }
     } catch (err) {
       errors.push(`discover page ${page}: ${(err as Error).message}`);
     }
   }
-  return [...seen.entries()].slice(0, MAX_TOKENS).map(([address, poolAddress]) => ({
-    address,
-    poolAddress,
-  }));
+  return [...seen.values()].slice(0, MAX_TOKENS);
 }
 
-async function fetchAllMetrics(addresses: string[], errors: string[]): Promise<TokenMetrics[]> {
-  const results: TokenMetrics[] = [];
-  for (const batch of chunk(addresses, METRICS_CHUNK_SIZE)) {
-    try {
-      const metrics = await fetchTokensMulti(batch);
-      results.push(...metrics);
-    } catch (err) {
-      errors.push(`metrics batch [${batch[0]}..]: ${(err as Error).message}`);
+/**
+ * Upserts every discovered token into tokens: pool_address always, and
+ * symbol/name/decimals when discovery returned them. tokens without
+ * metadata go in a separate upsert that omits those columns entirely, so a
+ * missing included entry never nulls out metadata already stored (e.g. a
+ * registry-seeded symbol).
+ */
+async function upsertTokens(discovered: DiscoveredToken[], errors: string[]): Promise<void> {
+  const withMetadata = discovered
+    .filter((t) => t.metadata)
+    .map((t) => ({
+      chain: CHAIN,
+      address: t.address,
+      symbol: t.metadata!.symbol,
+      name: t.metadata!.name,
+      decimals: t.metadata!.decimals,
+      is_rwa: false,
+      pool_address: t.poolAddress,
+    }));
+  const withoutMetadata = discovered
+    .filter((t) => !t.metadata)
+    .map((t) => ({
+      chain: CHAIN,
+      address: t.address,
+      is_rwa: false,
+      pool_address: t.poolAddress,
+    }));
+
+  for (const rows of [withMetadata, withoutMetadata]) {
+    if (rows.length === 0) continue;
+    const { error } = await supabase
+      .from("tokens")
+      .upsert(rows, { onConflict: "chain,address", ignoreDuplicates: false });
+    if (error) {
+      errors.push(`upsert tokens: ${error.message}`);
     }
-  }
-  return results;
-}
-
-async function upsertTokens(
-  metrics: TokenMetrics[],
-  poolAddressByAddress: Map<string, string>,
-  errors: string[],
-): Promise<void> {
-  if (metrics.length === 0) return;
-  const rows = metrics.map((m) => ({
-    chain: CHAIN,
-    address: m.address,
-    symbol: m.symbol,
-    name: m.name,
-    decimals: m.decimals,
-    is_rwa: false,
-    pool_address: poolAddressByAddress.get(m.address) ?? null,
-  }));
-  const { error } = await supabase
-    .from("tokens")
-    .upsert(rows, { onConflict: "chain,address", ignoreDuplicates: false });
-  if (error) {
-    errors.push(`upsert tokens: ${error.message}`);
-  }
-}
-
-async function insertTokenMetrics(metrics: TokenMetrics[], errors: string[]): Promise<void> {
-  if (metrics.length === 0) return;
-  const fetchedAt = new Date().toISOString();
-  const rows = metrics.map((m) => ({
-    chain: CHAIN,
-    address: m.address,
-    price_usd: m.price_usd,
-    volume_24h: m.volume_24h,
-    liquidity_usd: m.liquidity_usd,
-    market_cap: m.market_cap,
-    price_change_24h: null,
-    source: PRICE_WORKER_NAME,
-    fetched_at: fetchedAt,
-    is_estimate: false,
-  }));
-  const { error } = await supabase.from("token_metrics").insert(rows);
-  if (error) {
-    errors.push(`insert token_metrics: ${error.message}`);
   }
 }
 
 /**
- * Runs the price/discovery cycle and returns the tokens discovered this run
- * (address + top pool address), for the ohlcv job to reuse.
+ * Runs geckoterminal pool discovery and upserts the discovered tokens (with
+ * their top pool and metadata) into tokens. price/volume/liquidity/market
+ * cap are no longer fetched from geckoterminal -- dexscreener and jupiter
+ * cover them -- which leaves geckoterminal's rate limit to discovery and
+ * ohlcv. returns the discovered tokens for dexscreener to price.
  */
 export async function runPriceCycle(): Promise<DiscoveredToken[]> {
   const errors: string[] = [];
 
   const discovered = await discoverTokens(errors);
-  console.log(`discovered ${discovered.length} unique base token addresses`);
+  const missingMetadata = discovered.filter((t) => !t.metadata).length;
+  console.log(
+    `discovered ${discovered.length} unique base token addresses` +
+      (missingMetadata > 0 ? ` (${missingMetadata} without metadata)` : ""),
+  );
 
-  const metrics = await fetchAllMetrics(discovered.map((t) => t.address), errors);
-  console.log(`fetched metrics for ${metrics.length} tokens`);
-
-  const poolAddressByAddress = new Map(discovered.map((t) => [t.address, t.poolAddress]));
-  await upsertTokens(metrics, poolAddressByAddress, errors);
-  await insertTokenMetrics(metrics, errors);
+  await upsertTokens(discovered, errors);
   await writeWorkerStatus(PRICE_WORKER_NAME, errors);
 
   if (errors.length > 0) {
