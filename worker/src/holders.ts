@@ -11,7 +11,7 @@ import {
 import { CHAIN, normalizeAddress } from "./chain.js";
 
 export const HOLDERS_WORKER_NAME = "blockscout_holders";
-const MAX_TOKENS_PER_RUN = 25;
+const MAX_TOKENS_PER_RUN = 20;
 const TOP_HOLDERS = 20;
 const STALE_AFTER_MS = 6 * 60 * 60 * 1000;
 const PAGE_SIZE = 1000;
