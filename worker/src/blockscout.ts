@@ -12,6 +12,18 @@ const BASE_URL = `https://api.blockscout.com/${EVM_CHAIN_ID}/api/v2`;
 // bounded by the holders job's per-run cap and cadence instead.
 const throttle = createThrottle(120);
 
+export const CREDITS_PER_CALL = 20;
+export const FREE_TIER_DAILY_CREDITS = 100_000;
+
+// every request sent, counted before the response comes back: a call that
+// errors may still be billed, so the estimate errs high rather than low.
+let callCount = 0;
+
+/** requests sent since the worker process started. */
+export function blockscoutCallCount(): number {
+  return callCount;
+}
+
 interface TokenResponse {
   decimals?: string | null;
   total_supply?: string | null;
@@ -48,6 +60,7 @@ export interface TokenHolder {
 async function getJson<T>(path: string, label: string): Promise<T> {
   if (!env.BLOCKSCOUT_API_KEY) throw new Error("BLOCKSCOUT_API_KEY not set");
   await throttle();
+  callCount++;
   const sep = path.includes("?") ? "&" : "?";
   const res = await fetch(`${BASE_URL}${path}${sep}apikey=${env.BLOCKSCOUT_API_KEY}`, {
     headers: { Accept: "application/json" },

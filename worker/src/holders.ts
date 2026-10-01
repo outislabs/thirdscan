@@ -1,17 +1,59 @@
 import { supabase } from "./supabase.js";
 import { writeWorkerStatus } from "./workerStatus.js";
 import { env } from "./env.js";
-import { fetchTokenInfo, fetchTopHolders } from "./blockscout.js";
+import {
+  blockscoutCallCount,
+  CREDITS_PER_CALL,
+  FREE_TIER_DAILY_CREDITS,
+  fetchTokenInfo,
+  fetchTopHolders,
+} from "./blockscout.js";
 import { CHAIN, normalizeAddress } from "./chain.js";
 
 export const HOLDERS_WORKER_NAME = "blockscout_holders";
-const MAX_TOKENS_PER_RUN = 10;
+const MAX_TOKENS_PER_RUN = 25;
 const TOP_HOLDERS = 20;
 const STALE_AFTER_MS = 6 * 60 * 60 * 1000;
+const PAGE_SIZE = 1000;
 
 interface CandidateToken {
   address: string;
   decimals: number | null;
+  attemptedAt: string | null;
+}
+
+// credits spent in the current utc day by this process, for the per-run
+// log line. resets on restart, so after one it undercounts the day.
+let creditsDay = "";
+let creditsToday = 0;
+
+/**
+ * Every token on the chain, least recently attempted first: never
+ * attempted (null) first, then oldest holders_attempted_at. ties break on
+ * address so ordering is deterministic across pages.
+ */
+async function selectAttemptOrder(errors: string[]): Promise<Map<string, string | null> | null> {
+  const order = new Map<string, string | null>();
+  for (let from = 0; ; from += PAGE_SIZE) {
+    const { data, error } = await supabase
+      .from("tokens")
+      .select("address, holders_attempted_at")
+      .eq("chain", CHAIN)
+      .order("holders_attempted_at", { ascending: true, nullsFirst: true })
+      .order("address")
+      .range(from, from + PAGE_SIZE - 1);
+
+    if (error) {
+      errors.push(`query holders attempt order: ${error.message}`);
+      return null;
+    }
+    const page = data ?? [];
+    for (const row of page) {
+      order.set(row.address as string, (row.holders_attempted_at as string | null) ?? null);
+    }
+    if (page.length < PAGE_SIZE) break;
+  }
+  return order;
 }
 
 async function selectCandidateTokens(errors: string[]): Promise<CandidateToken[]> {
@@ -25,8 +67,23 @@ async function selectCandidateTokens(errors: string[]): Promise<CandidateToken[]
     errors.push(`query v_screener: ${screenerError.message}`);
     return [];
   }
-  const candidates = (screened ?? []) as CandidateToken[];
-  if (candidates.length === 0) return [];
+  const screenedRows = (screened ?? []) as { address: string; decimals: number | null }[];
+  if (screenedRows.length === 0) return [];
+
+  // order screened tokens least recently attempted first. if the order
+  // can't be read, fall back to v_screener's order rather than skip the run.
+  const attemptOrder = await selectAttemptOrder(errors);
+  const byAddress = new Map(screenedRows.map((row) => [row.address, row]));
+  let candidates: CandidateToken[];
+  if (attemptOrder) {
+    candidates = [];
+    for (const [address, attemptedAt] of attemptOrder) {
+      const row = byAddress.get(address);
+      if (row) candidates.push({ ...row, attemptedAt });
+    }
+  } else {
+    candidates = screenedRows.map((row) => ({ ...row, attemptedAt: null }));
+  }
 
   const cutoff = new Date(Date.now() - STALE_AFTER_MS).toISOString();
   const { data: freshRows, error: freshError } = await supabase
@@ -47,6 +104,17 @@ async function selectCandidateTokens(errors: string[]): Promise<CandidateToken[]
 
   const fresh = new Set((freshRows ?? []).map((row) => row.address as string));
   return candidates.filter((c) => !fresh.has(c.address));
+}
+
+async function markAttempted(address: string, errors: string[]): Promise<void> {
+  const { error } = await supabase
+    .from("tokens")
+    .update({ holders_attempted_at: new Date().toISOString() })
+    .eq("chain", CHAIN)
+    .eq("address", address);
+  if (error) {
+    errors.push(`mark holders attempted for ${address}: ${error.message}`);
+  }
 }
 
 /** raw / supply as a percentage, or null when supply is unknown or zero. */
@@ -144,7 +212,9 @@ async function processToken(token: CandidateToken, errors: string[], notes: stri
 
 /**
  * For up to MAX_TOKENS_PER_RUN tokens from v_screener with no risk_flag,
- * skipping any fetched in the last 6 hours, fetches the top 20 holders by
+ * skipping any fetched in the last 6 hours, least recently attempted
+ * first (every picked token gets holders_attempted_at set, whatever the
+ * outcome, so ones that keep failing rotate to the back), fetches the top 20 holders by
  * balance from blockscout (robinhood chain's explorer) and stores them plus
  * concentration stats and blockscout's holder count. 2 blockscout calls
  * per token.
@@ -161,14 +231,18 @@ export async function runHoldersCycle(): Promise<void> {
     return;
   }
 
+  const callsBefore = blockscoutCallCount();
   const candidates = await selectCandidateTokens(errors);
   const targets = candidates.slice(0, MAX_TOKENS_PER_RUN);
+  const neverAttempted = targets.filter((t) => t.attemptedAt === null).length;
   console.log(
-    `holders: ${candidates.length} tokens due for refresh, processing ${targets.length} (cap ${MAX_TOKENS_PER_RUN})`,
+    `holders: ${candidates.length} tokens due for refresh, processing ${targets.length} ` +
+      `(cap ${MAX_TOKENS_PER_RUN}; ${neverAttempted} never attempted)`,
   );
 
   let processed = 0;
   for (const token of targets) {
+    await markAttempted(token.address, errors);
     try {
       await processToken(token, errors, notes);
       processed++;
@@ -177,6 +251,19 @@ export async function runHoldersCycle(): Promise<void> {
     }
   }
   console.log(`holders: fetched ${processed} of ${targets.length} tokens`);
+
+  const calls = blockscoutCallCount() - callsBefore;
+  const credits = calls * CREDITS_PER_CALL;
+  const today = new Date().toISOString().slice(0, 10);
+  if (today !== creditsDay) {
+    creditsDay = today;
+    creditsToday = 0;
+  }
+  creditsToday += credits;
+  console.log(
+    `holders: blockscout ${calls} call(s), ~${credits} credits this run; ` +
+      `~${creditsToday} of ${FREE_TIER_DAILY_CREDITS} free-tier credits used today (utc, since worker start)`,
+  );
 
   // notes and errors both land in worker_status.last_error (the only text
   // field), but only errors make the cycle read as failed below.
