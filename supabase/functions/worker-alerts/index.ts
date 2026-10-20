@@ -40,7 +40,7 @@ Deno.serve(async (req) => {
   }
 
   const [config, status, state] = await Promise.all([
-    supabase.from("worker_alert_config").select("worker_name, interval_seconds"),
+    supabase.from("worker_alert_config").select("worker_name, interval_seconds, alert_on_error"),
     supabase.from("worker_status").select("worker_name, last_run_at, last_error"),
     supabase.from("worker_alert_state").select("worker_name, is_stale, last_error_seen"),
   ]);
@@ -54,7 +54,7 @@ Deno.serve(async (req) => {
   const messages: string[] = [];
   const updates: { worker_name: string; is_stale: boolean; last_error_seen: string | null; updated_at: string }[] = [];
 
-  for (const { worker_name, interval_seconds } of config.data!) {
+  for (const { worker_name, interval_seconds, alert_on_error } of config.data!) {
     const s = statusByName.get(worker_name);
     const prev = stateByName.get(worker_name);
     const lastRun = s?.last_run_at ? new Date(s.last_run_at).getTime() : null;
@@ -72,7 +72,7 @@ Deno.serve(async (req) => {
     }
 
     // first sighting of a worker only records its error as the baseline.
-    if (prev && lastError !== prev.last_error_seen) {
+    if (alert_on_error && prev && lastError !== prev.last_error_seen) {
       messages.push(
         lastError === null
           ? `ERROR CLEARED ${worker_name}`

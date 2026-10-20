@@ -11,15 +11,19 @@ create extension if not exists pg_net;
 -- absent: they are meant to be stale and carry a "paused" last_error.
 create table if not exists worker_alert_config (
   worker_name      text primary key,
-  interval_seconds integer not null check (interval_seconds > 0)
+  interval_seconds integer not null check (interval_seconds > 0),
+  -- false = staleness alerts only. blockscout_holders keeps routine notes
+  -- (supply mismatch, transient 500s) in last_error, so alerting on every
+  -- change would be noise.
+  alert_on_error   boolean not null default true
 );
 
-insert into worker_alert_config (worker_name, interval_seconds) values
-  ('dexscreener',         300),
-  ('geckoterminal',       300),
-  ('registry_seed',       300),
-  ('geckoterminal_ohlcv', 900),
-  ('blockscout_holders',  900)
+insert into worker_alert_config (worker_name, interval_seconds, alert_on_error) values
+  ('dexscreener',         300, true),
+  ('geckoterminal',       300, true),
+  ('registry_seed',       300, true),
+  ('geckoterminal_ohlcv', 900, true),
+  ('blockscout_holders',  900, false)
 on conflict (worker_name) do nothing;
 
 -- what was last alerted, so a persistent condition sends one message, not
