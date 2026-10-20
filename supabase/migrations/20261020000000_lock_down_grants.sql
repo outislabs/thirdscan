@@ -31,6 +31,19 @@ begin
 end
 $$;
 
+-- the views must run as their owner (security_invoker off, which is also the
+-- default): anon has no access to the raw tables below, so an invoker view
+-- would return nothing. verified against the live project on 2026-10-20 (all
+-- seven returned rows to anon while the raw tables returned none); this pins
+-- it so it can't drift.
+alter view v_screener            set (security_invoker = false);
+alter view v_token_profile       set (security_invoker = false);
+alter view v_token_ohlcv         set (security_invoker = false);
+alter view v_token_holders       set (security_invoker = false);
+alter view v_token_holder_stats  set (security_invoker = false);
+alter view v_projects            set (security_invoker = false);
+alter view v_token_registry      set (security_invoker = false);
+
 -- allowlist.
 grant select on
   v_screener,
