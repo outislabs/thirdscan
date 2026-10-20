@@ -23,6 +23,7 @@ const throttle = createThrottle(60);
 
 interface DexPair {
   chainId: string;
+  pairAddress?: string | null;
   baseToken: { address: string };
   priceUsd?: string | null;
   liquidity?: { usd?: number | null } | null;
@@ -48,6 +49,8 @@ interface TokenMetricsRow {
 interface DexscreenerResult {
   metrics: TokenMetricsRow;
   imageUrl: string | null;
+  // the highest-liquidity pair, lowercased; usable as a geckoterminal pool.
+  poolAddress: string | null;
 }
 
 function parseNumeric(value: number | string | null | undefined): number | null {
@@ -81,6 +84,7 @@ function toResult(address: string, pairs: DexPair[]): DexscreenerResult | null {
       price_change_24h: parseNumeric(pair.priceChange?.h24),
     },
     imageUrl,
+    poolAddress: pair.pairAddress ? normalizeAddress(pair.pairAddress) : null,
   };
 }
 
@@ -158,6 +162,48 @@ async function fillMissingImageUrls(imageUrls: Map<string, string>, errors: stri
   return rows.length;
 }
 
+/**
+ * Sets tokens.pool_address from dexscreener's top pair, but only where it's
+ * currently null. geckoterminal discovery only sees top-volume pools, so
+ * registry-seeded tokens (stock tokens) never got one and the ohlcv job,
+ * which selects on pool_address, skipped them entirely. dexscreener's pair
+ * address is the same pool id geckoterminal indexes for this chain. an
+ * existing pool_address (from discovery) is never replaced.
+ */
+async function fillMissingPoolAddresses(poolAddresses: Map<string, string>, errors: string[]): Promise<number> {
+  const needsPool: string[] = [];
+  for (const batch of chunk([...poolAddresses.keys()], IMAGE_CHECK_CHUNK_SIZE)) {
+    const { data, error } = await supabase
+      .from("tokens")
+      .select("address")
+      .eq("chain", CHAIN)
+      .in("address", batch)
+      .is("pool_address", null);
+    if (error) {
+      errors.push(`check tokens pool_address: ${error.message}`);
+      return 0;
+    }
+    needsPool.push(...(data ?? []).map((row) => row.address as string));
+  }
+  if (needsPool.length === 0) return 0;
+
+  // same shape as fillMissingImageUrls: rows exist, so only pool_address
+  // changes.
+  const rows = needsPool.map((address) => ({
+    chain: CHAIN,
+    address,
+    pool_address: poolAddresses.get(address)!,
+  }));
+  const { error } = await supabase
+    .from("tokens")
+    .upsert(rows, { onConflict: "chain,address", ignoreDuplicates: false });
+  if (error) {
+    errors.push(`set pool_address from dexscreener: ${error.message}`);
+    return 0;
+  }
+  return rows.length;
+}
+
 async function insertTokenMetrics(rows: TokenMetricsRow[], errors: string[]): Promise<void> {
   if (rows.length === 0) return;
   const fetchedAt = new Date().toISOString();
@@ -191,6 +237,7 @@ export async function runDexscreenerCycle(addresses: string[]): Promise<void> {
   const errors: string[] = [];
   const rows: TokenMetricsRow[] = [];
   const imageUrls = new Map<string, string>();
+  const poolAddresses = new Map<string, string>();
 
   const unique = [...new Set(addresses.map(normalizeAddress))];
   let calls = 0;
@@ -200,6 +247,7 @@ export async function runDexscreenerCycle(addresses: string[]): Promise<void> {
       for (const result of (await fetchDexscreenerBatch(batch)).values()) {
         rows.push(result.metrics);
         if (result.imageUrl) imageUrls.set(result.metrics.address, result.imageUrl);
+        if (result.poolAddress) poolAddresses.set(result.metrics.address, result.poolAddress);
       }
     } catch (err) {
       errors.push(`dexscreener batch [${batch[0]}..]: ${(err as Error).message}`);
@@ -215,6 +263,8 @@ export async function runDexscreenerCycle(addresses: string[]): Promise<void> {
   console.log(
     `dexscreener: ${imageUrls.size} tokens had an image, set image_url on ${imagesSet} that had none`,
   );
+  const poolsSet = await fillMissingPoolAddresses(poolAddresses, errors);
+  console.log(`dexscreener: set pool_address on ${poolsSet} token(s) that had none`);
   await writeWorkerStatus(DEXSCREENER_WORKER_NAME, errors);
 
   if (errors.length > 0) {
