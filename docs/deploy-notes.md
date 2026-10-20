@@ -57,6 +57,10 @@ Also on the VPS: `HELIUS_API_KEY` can be deleted from the VPS's `worker/.env` to
 
 Do the Supabase step (1) first or at the same time. The worker change is independent of it, but the grants migration is the one with security impact.
 
+## 2b. New worker jobs (wallets/entities)
+
+Same restart as above. The worker now also runs `blockscout_deployers` and `entity_labels` every 30 minutes. They use the existing `BLOCKSCOUT_API_KEY`; no new env vars. Expect ~14k extra Blockscout credits on the first day (one-time deployer backfill), capped at 15k/day by the job, on top of the holders job's up-to-76.8k/day.
+
 ## 3. Confirm after restart (about an hour)
 
 - Worker log line: `dexscreener: set pool_address on N token(s) that had none` should show ~102 on the first cycle, then 0.

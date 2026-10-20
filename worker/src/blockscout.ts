@@ -114,3 +114,113 @@ export async function fetchTopHolders(address: string, limit: number): Promise<T
   holders.sort((a, b) => (b.valueRaw > a.valueRaw ? 1 : b.valueRaw < a.valueRaw ? -1 : 0));
   return holders.slice(0, limit);
 }
+
+interface AddressResponse {
+  creator_address_hash?: string | null;
+  creation_transaction_hash?: string | null;
+}
+
+interface TransactionResponse {
+  from?: { hash?: string | null } | null;
+  timestamp?: string | null;
+}
+
+interface TokenBalancesResponseItem {
+  value?: string | null;
+  token?: {
+    address_hash?: string | null;
+    decimals?: string | null;
+    total_supply?: string | null;
+  } | null;
+}
+
+interface TokenTransfersResponse {
+  items?: {
+    from?: { hash?: string | null } | null;
+    to?: { hash?: string | null } | null;
+    total?: { value?: string | null } | null;
+  }[];
+  next_page_params?: Record<string, string | number | null> | null;
+}
+
+export interface TokenCreation {
+  creator: string | null; // contract/eoa that executed the create (factory when factory-made)
+  deployer: string | null; // sender of the creation transaction
+  creationTx: string | null;
+  deployedAt: string | null;
+}
+
+/** who created a token contract: creator, creation tx sender, and when. 2 calls. */
+export async function fetchTokenCreation(address: string): Promise<TokenCreation> {
+  const addr = await getJson<AddressResponse>(`/addresses/${address}`, `address ${address}`);
+  const creationTx = addr.creation_transaction_hash ?? null;
+  if (!creationTx) {
+    return { creator: addr.creator_address_hash ?? null, deployer: null, creationTx: null, deployedAt: null };
+  }
+  const tx = await getJson<TransactionResponse>(`/transactions/${creationTx}`, `creation tx of ${address}`);
+  return {
+    creator: addr.creator_address_hash ?? null,
+    deployer: tx.from?.hash ?? addr.creator_address_hash ?? null,
+    creationTx,
+    deployedAt: tx.timestamp ?? null,
+  };
+}
+
+export interface WalletTokenBalance {
+  valueRaw: bigint;
+  decimals: number | null;
+  totalSupplyRaw: bigint | null;
+}
+
+/** every erc-20 balance of a wallet, keyed by lowercased token address. 1 call. */
+export async function fetchWalletTokenBalances(wallet: string): Promise<Map<string, WalletTokenBalance>> {
+  const json = await getJson<TokenBalancesResponseItem[]>(`/addresses/${wallet}/token-balances`, `balances ${wallet}`);
+  const out = new Map<string, WalletTokenBalance>();
+  for (const item of Array.isArray(json) ? json : []) {
+    const token = item.token?.address_hash;
+    const valueRaw = parseBigInt(item.value);
+    if (!token || valueRaw === null) continue;
+    out.set(token.toLowerCase(), {
+      valueRaw,
+      decimals: parseInteger(item.token?.decimals),
+      totalSupplyRaw: parseBigInt(item.token?.total_supply),
+    });
+  }
+  return out;
+}
+
+export interface WalletTokenFlow {
+  inRaw: bigint; // received (including mints)
+  outRaw: bigint; // sent to anyone else
+  transfers: number;
+  complete: boolean; // false when more pages existed than were read
+}
+
+/**
+ * a wallet's transfers of one token, newest first, summed by direction.
+ * reads up to maxPages pages of 50 (1 call each).
+ */
+export async function fetchWalletTokenFlow(wallet: string, token: string, maxPages: number): Promise<WalletTokenFlow> {
+  const me = wallet.toLowerCase();
+  const flow: WalletTokenFlow = { inRaw: 0n, outRaw: 0n, transfers: 0, complete: true };
+  let query = `type=ERC-20&token=${token}`;
+  for (let page = 0; page < maxPages; page++) {
+    const json = await getJson<TokenTransfersResponse>(`/addresses/${wallet}/token-transfers?${query}`, `transfers ${wallet}`);
+    for (const item of json.items ?? []) {
+      const value = parseBigInt(item.total?.value);
+      const from = item.from?.hash?.toLowerCase();
+      const to = item.to?.hash?.toLowerCase();
+      if (value === null || from === to) continue;
+      flow.transfers++;
+      if (to === me) flow.inRaw += value;
+      else if (from === me) flow.outRaw += value;
+    }
+    const next = json.next_page_params;
+    if (!next) return flow;
+    query = `type=ERC-20&token=${token}&` + new URLSearchParams(
+      Object.entries(next).map(([k, v]): [string, string] => [k, String(v ?? "")]),
+    ).toString();
+  }
+  flow.complete = false;
+  return flow;
+}

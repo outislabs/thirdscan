@@ -3,6 +3,8 @@ import { runOhlcvCycle } from "./ohlcv.js";
 import { runDexscreenerCycle } from "./dexscreener.js";
 import { runRegistrySeed } from "./registry.js";
 import { runHoldersCycle } from "./holders.js";
+import { runDeployersCycle } from "./deployers.js";
+import { runEntityLabelCycle } from "./entities.js";
 import { CHAIN } from "./chain.js";
 import { supabase } from "./supabase.js";
 import { JUPITER_WORKER_NAME } from "./jupiter.js";
@@ -14,6 +16,9 @@ const OHLCV_INTERVAL_MS = 15 * 60 * 1000;
 // matched to ohlcv's cadence: holders is similarly a slower job with its
 // own staleness (6h) and per-run cap (20 tokens) guards.
 const HOLDERS_INTERVAL_MS = 15 * 60 * 1000;
+// deployers and entity labels are slow-moving; the deployers job is also
+// capped per run and per day (see deployers.ts).
+const DEPLOYERS_INTERVAL_MS = 30 * 60 * 1000;
 // worker_status name of the removed solana holders job, kept only so its
 // row can be marked paused.
 const HELIUS_HOLDERS_WORKER_NAME = "helius_holders";
@@ -69,6 +74,8 @@ async function main(): Promise<void> {
     await runDexscreenerCycle(dexscreenerAddresses(discovered, registry));
     await runOhlcvCycle();
     await runHoldersCycle();
+    await runDeployersCycle();
+    await runEntityLabelCycle();
     return;
   }
 
@@ -78,6 +85,7 @@ async function main(): Promise<void> {
   // crosses their interval mark.
   let lastOhlcvAt = 0;
   let lastHoldersAt = 0;
+  let lastDeployersAt = 0;
   await markPausedJobs();
 
   for (;;) {
@@ -94,6 +102,12 @@ async function main(): Promise<void> {
     if (startedAt - lastHoldersAt >= HOLDERS_INTERVAL_MS) {
       await runHoldersCycle();
       lastHoldersAt = Date.now();
+    }
+
+    if (startedAt - lastDeployersAt >= DEPLOYERS_INTERVAL_MS) {
+      await runDeployersCycle();
+      await runEntityLabelCycle();
+      lastDeployersAt = Date.now();
     }
 
     const elapsed = Date.now() - startedAt;
