@@ -10,20 +10,20 @@ Audited 2026-10-20 ~06:15 UTC. Read-only: no code, data, services or deployments
 - **This audit ran on a MacBook, not a VPS.** Nothing for Thirdscan runs on this machine. Runtime state below comes from the worker's own `worker_status` heartbeats in Supabase. Process supervision, uptime and raw logs live on whatever host runs the worker and could not be inspected.
 - **Main gaps:** no API layer (clients read Supabase views directly), no dev/insider tracking, no unbounded-growth control on `token_metrics` (1.8M rows), and Solana data is frozen since 2026-09-30.
 
-## Update 2026-10-20 (follow-up fixes)
+## Update 2026-10-20 (follow-up fixes, applied)
 
-Committed in the repo; **none of the Supabase-side changes are applied yet**. The CLI login on this MacBook has no access to project `gumcgvgsugttsuadqxhv` (403), so I could not push migrations, deploy the function, read the publishable key or run catalog SQL. Steps are in `docs/deploy-notes.md`.
+All migrations below are applied to `gumcgvgsugttsuadqxhv` and pushed to `origin/main`.
 
 | # | Item | State |
 |---|---|---|
-| 1 | Grants | Migration `20261020000000_lock_down_grants.sql` written, **not applied**. Resets every table/view/sequence in `public` for anon/authenticated, then grants SELECT on the 7 v_* views + `worker_status` and INSERT on `early_access_signups`; aborts if the result differs. The anon `GET /rest/v1/v_projects?chain=eq.robinhood` = 14 check is **not done** (no anon key available); the service-role read still returns 14. |
-| 2 | Alerting | Migration `20261020010000_worker_alerting.sql` (pg_cron every 5 min, config and state tables) and edge function `supabase/functions/worker-alerts`. Alerts on last_run_at older than 3x interval, recovery, and `last_error` changes. **Not deployed**; needs Telegram token and chat id as secrets plus two Vault entries. |
-| 3 | Retention | Plan only, nothing deleted: `docs/retention-plan.md`. Keep 7 days raw, then 1 row per token/source/hour: 1.83M rows to ~640k (about 1.19M deleted, ~10x slower growth), roughly 0.35-0.45 GB estimated. |
-| 4 | OHLCV coverage | Cause found and fixed in `dexscreener.ts`. All 102 screener tokens without candles were registry-seeded stock tokens with **no `pool_address`** (GeckoTerminal discovery only sees top pools, and the ohlcv job selects on `pool_address`). Not API limits, not too-new tokens. The worker now fills `pool_address` from DexScreener's top pair where null; 7 of 7 non-rate-limited probes returned candles from GeckoTerminal. Takes effect after the VPS restart; expect coverage to climb toward ~190 over about an hour. |
-| 5 | Cleanup | `HELIUS_API_KEY` removed from `worker/.env` (MacBook copy only; also remove it on the VPS). Frozen Solana rows listed, not deleted: `docs/solana-frozen-rows.md`. Stale "10 tokens" comment fixed. |
-| 6 | Deploy notes | `docs/deploy-notes.md`. |
+| 1 | Grants | **Applied** (`20261020000000_lock_down_grants.sql`). Before applying I checked the views: all 7 `v_*` views run as their owner (anon got rows from them while raw tables returned none), so none needs raw-table access; the migration now pins `security_invoker = false` on each. Anon check with the publishable key: `v_projects?chain=eq.robinhood` = **14 rows**; `v_screener`, `v_token_profile`, `v_token_ohlcv`, `v_token_holders`, `v_token_holder_stats`, `v_token_registry`, `worker_status` all 200; `token_metrics`, `tokens`, `token_holders`, `token_ohlcv`, `rwa_issuers`, `projects`, `security_audit`, `early_access_signups` (select) and the alert tables all 401 (42501); a write to a view is 401. Anon INSERT into `early_access_signups` was not exercised (would leave a junk row); the migration asserts the privilege. |
+| 2 | Alerting | **Deployed, waiting on your secrets.** Migration `20261020010000` applied (pg_cron every 5 min, `worker_alert_config`/`worker_alert_state`); `worker-alerts` function deployed with `--no-verify-jwt` (returns 401 without the cron secret). Staleness alerts at 3x interval for all 5 active workers; `last_error` change alerts for all but `blockscout_holders` (staleness only). It will not send anything until the Telegram secrets and Vault entries exist (commands in `docs/deploy-notes.md`). |
+| 3 | Retention | **Done.** Backup first: `archive/token_metrics_pre_retention_20261020.csv`, **262 MB**, 1,834,062 rows, count verified equal to the database. (An API export, not `pg_dump`: no DB password or Docker here.) Then `thin_token_metrics` deleted **1,183,706** rows in 85 six-hour windows: 145,920 hourly rows remain beyond 7 days, 504,706 raw rows in the last 7 days untouched. Hourly pg_cron job `token-metrics-thinning` (minute 7) keeps it thinned going forward. Added index `idx_token_metrics_fetched_at` (first attempt timed out without it). |
+| 4 | OHLCV coverage | Code fix in `dexscreener.ts` is pushed but **takes effect only when the VPS worker is restarted** (see deploy notes). |
+| 5 | Cleanup | `HELIUS_API_KEY` removed from the MacBook `worker/.env`; still to remove on the VPS. |
+| 6 | Solana | **Archived and deleted.** CSVs in `archive/` (gitignored): tokens 1,734 · metrics 383,409 · ohlcv 12,838 · holders 3,960 · holder stats 483, counts matching `docs/solana-frozen-rows.md` (metrics from the verified full backup; live metrics had already been thinned to 52,487). `delete from tokens where chain = 'solana'` cascaded: all five tables now have 0 solana rows. `rwa_issuers` solana (1,026) deliberately kept (registry reference data). `v_screener` is 196 rows, all robinhood. |
 
-Open decisions for you: apply the migrations and deploy; approve or adjust the retention plan; archive/delete/keep Solana rows.
+Also: Supabase CLI here is 2.75.0; I did not upgrade it (a brew upgrade wanted to compile Rust/Go/Bun; cancelled). Worker error-prone spots in the open-risks list below are unchanged.
 
 ---
 
@@ -137,18 +137,18 @@ Context: 1,547 of the robinhood `token_holder_stats` history rows have `top20_pe
 | RWA / stock-token registry | **Working** | 195 Robinhood + 1,026 Solana issuers; `is_rwa` and `issuer_name` in the screener (121 of 192 are RWA) |
 | Holder stats (top-20, concentration, holder count) | **Working** | 190 of 192 screener tokens have stats; 179 robinhood tokens refreshed in the last 6h |
 | Wallet labels / contract flag on holders | **Partial** | Blockscout `is_contract` and name/ENS label only (1,895 labelled holder rows, 6,283 flagged contracts). No curated or cross-chain labelling. |
-| OHLCV (hourly candles) | **Partial, fix pending deploy** | 90 of 192 screener tokens have candles; the other 102 had no `pool_address`. Backfill from DexScreener committed 2026-10-20, awaiting worker restart |
+| OHLCV (hourly candles) | **Partial, fix pending worker restart** | 90 of 192 screener tokens have candles; the other 102 had no `pool_address`. Backfill from DexScreener committed 2026-10-20, awaiting worker restart |
 | Projects directory | **Partial** | Table, view and 14 seeded rows exist; manual curation only |
 | Chainlink price feeds for stock tokens | **Researched, not built** | 36 of 195 registry tokens have a feed proxy; mapping is by ticker only (see session notes) |
 | Dev / insider tracking (deployer, early buyers, linked wallets) | **Missing** | No code or schema |
 | API layer | **Missing** | Clients call Supabase PostgREST views directly with the anon key; no server-side API, auth, rate limiting or caching in this repo |
-| Solana pipeline | **Paused / stale** | 1,734 tokens and 12.8k candles frozen at 2026-09-30 |
-| Alerting / monitoring | **Written, not deployed** | pg_cron + edge function committed 2026-10-20; see update section |
+| Solana pipeline | **Removed** | rows archived to `archive/` (gitignored) and deleted 2026-10-20; paused jupiter code remains |
+| Alerting / monitoring | **Deployed, needs secrets** | pg_cron + `worker-alerts` function live; sends nothing until Telegram secrets/Vault entries are set |
 
 ## Open risks
 
 - **Out-of-repo schema changes.** Two migrations (`v_token_registry` 2026-10-01, `early_access_signups` 2026-10-05) were applied to the remote outside the repo, with UUID-style names, probably from an app builder. The first shipped with full write grants to anon (fixed 2026-10-06; audit in `security_audit`). Other objects may be affected the same way.
-- **No retention on `token_metrics`** (1.8M rows in ~4 weeks, append-only) while `v_screener` runs five lateral lookups per token against it. Query cost will keep growing.
+- ~~No retention on `token_metrics`~~ resolved 2026-10-20 (hourly thinning job). Context: it was 1.8M rows in ~4 weeks while `v_screener` runs five lateral lookups per token against it. Query cost will keep growing.
 - **Holder snapshot is delete-then-insert, not atomic.** If the insert fails after the delete, a token ends up with no holders until the next run (the failure is recorded in `worker_status`).
 - **Single unmonitored worker process** on an unseen host.
 

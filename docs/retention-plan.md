@@ -1,4 +1,4 @@
-# token_metrics retention plan (proposal, nothing deleted)
+# token_metrics retention plan (executed 2026-10-20: 1,183,706 rows thinned, backup in archive/)
 
 Measured 2026-10-20 via service-role reads (row counts exact; sizes are estimates, see "Measure first").
 
