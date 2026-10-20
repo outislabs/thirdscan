@@ -12,7 +12,7 @@ const DRY_RUN = process.argv.includes("--dry-run");
 const PRICE_INTERVAL_MS = 5 * 60 * 1000;
 const OHLCV_INTERVAL_MS = 15 * 60 * 1000;
 // matched to ohlcv's cadence: holders is similarly a slower job with its
-// own staleness (6h) and per-run cap (10 tokens) guards.
+// own staleness (6h) and per-run cap (20 tokens) guards.
 const HOLDERS_INTERVAL_MS = 15 * 60 * 1000;
 // worker_status name of the removed solana holders job, kept only so its
 // row can be marked paused.
